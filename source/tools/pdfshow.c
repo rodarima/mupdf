@@ -2,7 +2,11 @@
  * pdfshow -- the ultimate pdf debugging tool
  */
 
+#include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+
+#include <stdlib.h>
+#include <stdio.h>
 
 static pdf_document *doc = NULL;
 static fz_context *ctx = NULL;
@@ -25,9 +29,9 @@ static void showtrailer(void)
 {
 	if (!doc)
 		fz_throw(ctx, FZ_ERROR_GENERIC, "no file specified");
-	fz_printf(ctx, out, "trailer\n");
+	fz_write_printf(ctx, out, "trailer\n");
 	pdf_print_obj(ctx, out, pdf_trailer(ctx, doc), 0);
-	fz_printf(ctx, out, "\n");
+	fz_write_printf(ctx, out, "\n");
 }
 
 static void showencrypt(void)
@@ -39,9 +43,27 @@ static void showencrypt(void)
 	encrypt = pdf_dict_get(ctx, pdf_trailer(ctx, doc), PDF_NAME_Encrypt);
 	if (!encrypt)
 		fz_throw(ctx, FZ_ERROR_GENERIC, "document not encrypted");
-	fz_printf(ctx, out, "encryption dictionary\n");
+	fz_write_printf(ctx, out, "encryption dictionary\n");
 	pdf_print_obj(ctx, out, pdf_resolve_indirect(ctx, encrypt), 0);
-	fz_printf(ctx, out, "\n");
+	fz_write_printf(ctx, out, "\n");
+}
+
+void
+pdf_print_xref(fz_context *ctx, pdf_document *doc)
+{
+	int i;
+	int xref_len = pdf_xref_len(ctx, doc);
+	printf("xref\n0 %d\n", xref_len);
+	for (i = 0; i < xref_len; i++)
+	{
+		pdf_xref_entry *entry = pdf_get_xref_entry(ctx, doc, i);
+		printf("%05d: %010d %05d %c (stm_ofs=%d; stm_buf=%p)\n", i,
+				(int)entry->ofs,
+				entry->gen,
+				entry->type ? entry->type : '-',
+				(int)entry->stm_ofs,
+				entry->stm_buf);
+	}
 }
 
 static void showxref(void)
@@ -49,7 +71,7 @@ static void showxref(void)
 	if (!doc)
 		fz_throw(ctx, FZ_ERROR_GENERIC, "no file specified");
 	pdf_print_xref(ctx, doc);
-	fz_printf(ctx, out, "\n");
+	fz_write_printf(ctx, out, "\n");
 }
 
 static void showpagetree(void)
@@ -65,14 +87,14 @@ static void showpagetree(void)
 	for (i = 0; i < count; i++)
 	{
 		ref = pdf_lookup_page_obj(ctx, doc, i);
-		fz_printf(ctx, out, "page %d = %d %d R\n", i + 1, pdf_to_num(ctx, ref), pdf_to_gen(ctx, ref));
+		fz_write_printf(ctx, out, "page %d = %d 0 R\n", i + 1, pdf_to_num(ctx, ref));
 	}
-	fz_printf(ctx, out, "\n");
+	fz_write_printf(ctx, out, "\n");
 }
 
-static void showsafe(unsigned char *buf, int n)
+static void showsafe(unsigned char *buf, size_t n)
 {
-	int i;
+	size_t i;
 	for (i = 0; i < n; i++) {
 		if (buf[i] == '\r' || buf[i] == '\n') {
 			putchar('\n');
@@ -93,18 +115,18 @@ static void showsafe(unsigned char *buf, int n)
 	}
 }
 
-static void showstream(int num, int gen)
+static void showstream(int num)
 {
 	fz_stream *stm;
 	unsigned char buf[2048];
-	int n;
+	size_t n;
 
 	showcolumn = 0;
 
 	if (showdecode)
-		stm = pdf_open_stream(ctx, doc, num, gen);
+		stm = pdf_open_stream_number(ctx, doc, num);
 	else
-		stm = pdf_open_raw_stream(ctx, doc, num, gen);
+		stm = pdf_open_raw_stream_number(ctx, doc, num);
 
 	while (1)
 	{
@@ -112,7 +134,7 @@ static void showstream(int num, int gen)
 		if (n == 0)
 			break;
 		if (showbinary)
-			fz_write(ctx, out, buf, n);
+			fz_write_data(ctx, out, buf, n);
 		else
 			showsafe(buf, n);
 	}
@@ -120,36 +142,36 @@ static void showstream(int num, int gen)
 	fz_drop_stream(ctx, stm);
 }
 
-static void showobject(int num, int gen)
+static void showobject(int num)
 {
 	pdf_obj *obj;
 
 	if (!doc)
 		fz_throw(ctx, FZ_ERROR_GENERIC, "no file specified");
 
-	obj = pdf_load_object(ctx, doc, num, gen);
+	obj = pdf_load_object(ctx, doc, num);
 
 	if (pdf_is_stream(ctx, obj))
 	{
 		if (showbinary)
 		{
-			showstream(num, gen);
+			showstream(num);
 		}
 		else
 		{
-			fz_printf(ctx, out, "%d %d obj\n", num, gen);
+			fz_write_printf(ctx, out, "%d 0 obj\n", num);
 			pdf_print_obj(ctx, out, obj, 0);
-			fz_printf(ctx, out, "\nstream\n");
-			showstream(num, gen);
-			fz_printf(ctx, out, "endstream\n");
-			fz_printf(ctx, out, "endobj\n\n");
+			fz_write_printf(ctx, out, "\nstream\n");
+			showstream(num);
+			fz_write_printf(ctx, out, "endstream\n");
+			fz_write_printf(ctx, out, "endobj\n\n");
 		}
 	}
 	else
 	{
-		fz_printf(ctx, out, "%d %d obj\n", num, gen);
+		fz_write_printf(ctx, out, "%d 0 obj\n", num);
 		pdf_print_obj(ctx, out, obj, 0);
-		fz_printf(ctx, out, "\nendobj\n\n");
+		fz_write_printf(ctx, out, "\nendobj\n\n");
 	}
 
 	pdf_drop_obj(ctx, obj);
@@ -168,7 +190,7 @@ static void showgrep(char *filename)
 		{
 			fz_try(ctx)
 			{
-				obj = pdf_load_object(ctx, doc, i, 0);
+				obj = pdf_load_object(ctx, doc, i);
 			}
 			fz_catch(ctx)
 			{
@@ -178,37 +200,43 @@ static void showgrep(char *filename)
 
 			pdf_sort_dict(ctx, obj);
 
-			fz_printf(ctx, out, "%s:%d: ", filename, i);
+			fz_write_printf(ctx, out, "%s:%d: ", filename, i);
 			pdf_print_obj(ctx, out, obj, 1);
+			fz_write_printf(ctx, out, "\n");
 
 			pdf_drop_obj(ctx, obj);
 		}
 	}
 
-	fz_printf(ctx, out, "%s:trailer: ", filename);
+	fz_write_printf(ctx, out, "%s:trailer: ", filename);
 	pdf_print_obj(ctx, out, pdf_trailer(ctx, doc), 1);
+	fz_write_printf(ctx, out, "\n");
+}
+
+static void
+fz_print_outline(fz_context *ctx, fz_output *out, fz_outline *outline, int level)
+{
+	int i;
+	while (outline)
+	{
+		for (i = 0; i < level; i++)
+			fz_write_printf(ctx, out, "\t");
+		fz_write_printf(ctx, out, "%s\t%s\n", outline->title, outline->uri);
+		if (outline->down)
+			fz_print_outline(ctx, out, outline->down, level + 1);
+		outline = outline->next;
+	}
 }
 
 static void showoutline(void)
 {
 	fz_outline *outline = fz_load_outline(ctx, (fz_document*)doc);
-	fz_output *out = NULL;
-
-	fz_var(out);
 	fz_try(ctx)
-	{
-		out = fz_stdout(ctx);
-		fz_print_outline(ctx, out, outline);
-	}
+		fz_print_outline(ctx, fz_stdout(ctx), outline, 0);
 	fz_always(ctx)
-	{
-		fz_drop_output(ctx, out);
 		fz_drop_outline(ctx, outline);
-	}
 	fz_catch(ctx)
-	{
 		fz_rethrow(ctx);
-	}
 }
 
 int pdfshow_main(int argc, char **argv)
@@ -268,10 +296,12 @@ int pdfshow_main(int argc, char **argv)
 			case 'p': showpagetree(); break;
 			case 'g': showgrep(filename); break;
 			case 'o': showoutline(); break;
-			default: showobject(atoi(argv[fz_optind]), 0); break;
+			default: showobject(atoi(argv[fz_optind])); break;
 			}
 			fz_optind++;
 		}
+
+		fz_close_output(ctx, out);
 	}
 	fz_catch(ctx)
 	{

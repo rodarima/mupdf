@@ -1,6 +1,12 @@
+#include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+#include "../fitz/fitz-imp.h"
 
 #include "pdf-name-table.h"
+
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
 
 typedef enum pdf_objkind_e
 {
@@ -23,9 +29,9 @@ enum
 {
 	PDF_FLAGS_MARKED = 1,
 	PDF_FLAGS_SORTED = 2,
-	PDF_FLAGS_MEMO = 4,
-	PDF_FLAGS_MEMO_BOOL = 8,
-	PDF_FLAGS_DIRTY = 16
+	PDF_FLAGS_DIRTY = 4,
+	PDF_FLAGS_MEMO_BASE = 8,
+	PDF_FLAGS_MEMO_BASE_BOOL = 16
 };
 
 struct pdf_obj_s
@@ -40,7 +46,7 @@ typedef struct pdf_obj_num_s
 	pdf_obj super;
 	union
 	{
-		fz_off_t i;
+		int64_t i;
 		float f;
 	} u;
 } pdf_obj_num;
@@ -48,7 +54,7 @@ typedef struct pdf_obj_num_s
 typedef struct pdf_obj_string_s
 {
 	pdf_obj super;
-	unsigned short len;
+	unsigned int len;
 	char buf[1];
 } pdf_obj_string;
 
@@ -106,22 +112,10 @@ pdf_new_bool(fz_context *ctx, pdf_document *doc, int b)
 }
 
 pdf_obj *
-pdf_new_int(fz_context *ctx, pdf_document *doc, int i)
+pdf_new_int(fz_context *ctx, pdf_document *doc, int64_t i)
 {
 	pdf_obj_num *obj;
 	obj = Memento_label(fz_malloc(ctx, sizeof(pdf_obj_num)), "pdf_obj(int)");
-	obj->super.refs = 1;
-	obj->super.kind = PDF_INT;
-	obj->super.flags = 0;
-	obj->u.i = i;
-	return &obj->super;
-}
-
-pdf_obj *
-pdf_new_int_offset(fz_context *ctx, pdf_document *doc, fz_off_t i)
-{
-	pdf_obj_num *obj;
-	obj = Memento_label(fz_malloc(ctx, sizeof(pdf_obj_num)), "pdf_obj(offset)");
 	obj->super.refs = 1;
 	obj->super.kind = PDF_INT;
 	obj->super.flags = 0;
@@ -142,14 +136,19 @@ pdf_new_real(fz_context *ctx, pdf_document *doc, float f)
 }
 
 pdf_obj *
-pdf_new_string(fz_context *ctx, pdf_document *doc, const char *str, int len)
+pdf_new_string(fz_context *ctx, pdf_document *doc, const char *str, size_t len)
 {
 	pdf_obj_string *obj;
+	unsigned int l = (unsigned int)len;
+
+	if ((size_t)l != len)
+		fz_throw(ctx, FZ_ERROR_GENERIC, "Overflow in pdf string");
+
 	obj = Memento_label(fz_malloc(ctx, offsetof(pdf_obj_string, buf) + len + 1), "pdf_obj(string)");
 	obj->super.refs = 1;
 	obj->super.kind = PDF_STRING;
 	obj->super.flags = 0;
-	obj->len = len;
+	obj->len = l;
 	memcpy(obj->buf, str, len);
 	obj->buf[len] = '\0';
 	return &obj->super;
@@ -165,7 +164,7 @@ pdf_obj *
 pdf_new_name(fz_context *ctx, pdf_document *doc, const char *str)
 {
 	pdf_obj_name *obj;
-	char **stdname;
+	const char **stdname;
 
 	stdname = bsearch(str, &PDF_NAMES[1], PDF_OBJ_ENUM_NAME__LIMIT-1, sizeof(char *), namecmp);
 	if (stdname != NULL)
@@ -198,75 +197,93 @@ pdf_keep_obj(fz_context *ctx, pdf_obj *obj)
 {
 	if (obj >= PDF_OBJ__LIMIT)
 	{
-		(void)Memento_takeRef(obj);
-		obj->refs ++;
+		(void)fz_keep_imp16(ctx, obj, &obj->refs);
 	}
 	return obj;
 }
 
-int pdf_is_indirect(fz_context *ctx, pdf_obj *obj)
-{
-	return obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_INDIRECT : 0;
-}
+#define OBJ_IS_NULL(obj) \
+	(obj == PDF_OBJ_NULL)
+#define OBJ_IS_BOOL(obj) \
+	(obj == PDF_OBJ_TRUE || obj == PDF_OBJ_FALSE)
+#define OBJ_IS_INT(obj) \
+	(obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_INT : 0)
+#define OBJ_IS_REAL(obj) \
+	(obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_REAL : 0)
+#define OBJ_IS_NUMBER(obj) \
+	(obj >= PDF_OBJ__LIMIT ? (obj->kind == PDF_REAL || obj->kind == PDF_INT) : 0)
+#define OBJ_IS_STRING(obj) \
+	(obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_STRING : 0)
+#define OBJ_IS_NAME(obj) \
+	((obj >= PDF_OBJ__LIMIT) ? (obj->kind == PDF_NAME) : (obj != NULL && obj < PDF_OBJ_NAME__LIMIT))
+#define OBJ_IS_ARRAY(obj) \
+	(obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_ARRAY : 0)
+#define OBJ_IS_DICT(obj) \
+	(obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_DICT : 0)
+#define OBJ_IS_INDIRECT(obj) \
+	(obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_INDIRECT : 0)
 
 #define RESOLVE(obj) \
-	if (obj >= PDF_OBJ__LIMIT && obj->kind == PDF_INDIRECT) \
-		obj = pdf_resolve_indirect(ctx, obj); \
+	if (OBJ_IS_INDIRECT(obj)) \
+		obj = pdf_resolve_indirect_chain(ctx, obj); \
+
+int pdf_is_indirect(fz_context *ctx, pdf_obj *obj)
+{
+	return OBJ_IS_INDIRECT(obj);
+}
 
 int pdf_is_null(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	return obj == PDF_OBJ_NULL;
+	return OBJ_IS_NULL(obj);
 }
 
 int pdf_is_bool(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	return obj == PDF_OBJ_TRUE || obj == PDF_OBJ_FALSE;
+	return OBJ_IS_BOOL(obj);
 }
 
 int pdf_is_int(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	return obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_INT : 0;
+	return OBJ_IS_INT(obj);
 }
 
 int pdf_is_real(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	return obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_REAL : 0;
+	return OBJ_IS_REAL(obj);
 }
 
 int pdf_is_number(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	return obj >= PDF_OBJ__LIMIT ? (obj->kind == PDF_REAL || obj->kind == PDF_INT) : 0;
+	return OBJ_IS_NUMBER(obj);
 }
 
 int pdf_is_string(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	return obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_STRING : 0;
+	return OBJ_IS_STRING(obj);
 }
 
 int pdf_is_name(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT)
-		return obj != NULL && obj < PDF_OBJ_NAME__LIMIT;
-	return obj->kind == PDF_NAME;
+	return OBJ_IS_NAME(obj);
 }
 
 int pdf_is_array(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	return obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_ARRAY : 0;
+	return OBJ_IS_ARRAY(obj);
 }
 
 int pdf_is_dict(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	return obj >= PDF_OBJ__LIMIT ? obj->kind == PDF_DICT : 0;
+	return OBJ_IS_DICT(obj);
 }
 
 int pdf_to_bool(fz_context *ctx, pdf_obj *obj)
@@ -287,7 +304,7 @@ int pdf_to_int(fz_context *ctx, pdf_obj *obj)
 	return 0;
 }
 
-fz_off_t pdf_to_offset(fz_context *ctx, pdf_obj *obj)
+int64_t pdf_to_int64(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
 	if (obj < PDF_OBJ__LIMIT)
@@ -295,7 +312,7 @@ fz_off_t pdf_to_offset(fz_context *ctx, pdf_obj *obj)
 	if (obj->kind == PDF_INT)
 		return NUM(obj)->u.i;
 	if (obj->kind == PDF_REAL)
-		return (fz_off_t)(NUM(obj)->u.f + 0.5f); /* No roundf in MSVC */
+		return (NUM(obj)->u.f + 0.5f); /* No roundf in MSVC */
 	return 0;
 }
 
@@ -311,22 +328,20 @@ float pdf_to_real(fz_context *ctx, pdf_obj *obj)
 	return 0;
 }
 
-char *pdf_to_name(fz_context *ctx, pdf_obj *obj)
+const char *pdf_to_name(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	if (!obj)
+	if (!OBJ_IS_NAME(obj))
 		return "";
 	if (obj < PDF_OBJ_NAME__LIMIT)
 		return PDF_NAMES[(intptr_t)obj];
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_NAME)
-		return "";
 	return NAME(obj)->n;
 }
 
 char *pdf_to_str_buf(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_STRING)
+	if (!OBJ_IS_STRING(obj))
 		return "";
 	return STRING(obj)->buf;
 }
@@ -334,21 +349,14 @@ char *pdf_to_str_buf(fz_context *ctx, pdf_obj *obj)
 int pdf_to_str_len(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_STRING)
+	if (!OBJ_IS_STRING(obj))
 		return 0;
 	return STRING(obj)->len;
 }
 
-void pdf_set_int(fz_context *ctx, pdf_obj *obj, int i)
+void pdf_set_int(fz_context *ctx, pdf_obj *obj, int64_t i)
 {
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_INT)
-		return;
-	NUM(obj)->u.i = i;
-}
-
-void pdf_set_int_offset(fz_context *ctx, pdf_obj *obj, fz_off_t i)
-{
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_INT)
+	if (!OBJ_IS_INT(obj))
 		return;
 	NUM(obj)->u.i = i;
 }
@@ -357,36 +365,30 @@ void pdf_set_int_offset(fz_context *ctx, pdf_obj *obj, fz_off_t i)
 void pdf_set_str_len(fz_context *ctx, pdf_obj *obj, int newlen)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_STRING)
+	if (!OBJ_IS_STRING(obj))
 		return; /* This should never happen */
-	if (newlen > STRING(obj)->len)
+	if (newlen < 0 || (unsigned int)newlen > STRING(obj)->len)
 		return; /* This should never happen */
 	STRING(obj)->len = newlen;
 }
 
-pdf_obj *pdf_to_dict(fz_context *ctx, pdf_obj *obj)
-{
-	RESOLVE(obj);
-	return (obj >= PDF_OBJ__LIMIT && obj->kind == PDF_DICT ? obj : NULL);
-}
-
 int pdf_to_num(fz_context *ctx, pdf_obj *obj)
 {
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_INDIRECT)
+	if (!OBJ_IS_INDIRECT(obj))
 		return 0;
 	return REF(obj)->num;
 }
 
 int pdf_to_gen(fz_context *ctx, pdf_obj *obj)
 {
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_INDIRECT)
+	if (!OBJ_IS_INDIRECT(obj))
 		return 0;
 	return REF(obj)->gen;
 }
 
 pdf_document *pdf_get_indirect_document(fz_context *ctx, pdf_obj *obj)
 {
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_INDIRECT)
+	if (!OBJ_IS_INDIRECT(obj))
 		return NULL;
 	return REF(obj)->doc;
 }
@@ -502,7 +504,6 @@ pdf_objcmp(fz_context *ctx, pdf_obj *a, pdf_obj *b)
 				return 1;
 		}
 		return 0;
-
 	}
 	return 1;
 }
@@ -585,15 +586,21 @@ pdf_copy_array(fz_context *ctx, pdf_obj *obj)
 	int n;
 
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_ARRAY)
-		fz_throw(ctx, FZ_ERROR_GENERIC, "assert: not an array (%s)", pdf_objkindstr(obj));
+	if (!OBJ_IS_ARRAY(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not an array (%s)", pdf_objkindstr(obj));
 
 	doc = ARRAY(obj)->doc;
 
 	n = pdf_array_len(ctx, obj);
 	arr = pdf_new_array(ctx, doc, n);
-	for (i = 0; i < n; i++)
-		pdf_array_push(ctx, arr, pdf_array_get(ctx, obj, i));
+	fz_try(ctx)
+		for (i = 0; i < n; i++)
+			pdf_array_push(ctx, arr, pdf_array_get(ctx, obj, i));
+	fz_catch(ctx)
+	{
+		pdf_drop_obj(ctx, arr);
+		fz_rethrow(ctx);
+	}
 
 	return arr;
 }
@@ -602,7 +609,7 @@ int
 pdf_array_len(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_ARRAY)
+	if (!OBJ_IS_ARRAY(obj))
 		return 0;
 	return ARRAY(obj)->len;
 }
@@ -611,7 +618,7 @@ pdf_obj *
 pdf_array_get(fz_context *ctx, pdf_obj *obj, int i)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_ARRAY)
+	if (!OBJ_IS_ARRAY(obj))
 		return NULL;
 	if (i < 0 || i >= ARRAY(obj)->len)
 		return NULL;
@@ -620,7 +627,7 @@ pdf_array_get(fz_context *ctx, pdf_obj *obj, int i)
 
 static void prepare_object_for_alteration(fz_context *ctx, pdf_obj *obj, pdf_obj *val)
 {
-	pdf_document *doc;
+	pdf_document *doc, *val_doc;
 	int parent;
 
 	/*
@@ -643,6 +650,14 @@ static void prepare_object_for_alteration(fz_context *ctx, pdf_obj *obj, pdf_obj
 	default:
 		return;
 	}
+
+	if (val)
+	{
+		val_doc = pdf_get_bound_document(ctx, val);
+		if (doc && val_doc && val_doc != doc)
+			fz_throw(ctx, FZ_ERROR_GENERIC, "container and item belong to different documents");
+	}
+
 	/*
 		parent_num = 0 while an object is being parsed from the file.
 		No further action is necessary.
@@ -663,51 +678,50 @@ void
 pdf_array_put(fz_context *ctx, pdf_obj *obj, int i, pdf_obj *item)
 {
 	RESOLVE(obj);
-	if (obj >= PDF_OBJ__LIMIT)
+	if (!OBJ_IS_ARRAY(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not an array (%s)", pdf_objkindstr(obj));
+	if (i == ARRAY(obj)->len)
 	{
-		prepare_object_for_alteration(ctx, obj, item);
-
-		if (obj->kind != PDF_ARRAY)
-			fz_warn(ctx, "assert: not an array (%s)", pdf_objkindstr(obj));
-		else if (i < 0)
-			fz_warn(ctx, "assert: index %d < 0", i);
-		else if (i >= ARRAY(obj)->len)
-			fz_warn(ctx, "assert: index %d > length %d", i, ARRAY(obj)->len);
-		else
-		{
-			pdf_drop_obj(ctx, ARRAY(obj)->items[i]);
-			ARRAY(obj)->items[i] = pdf_keep_obj(ctx, item);
-		}
+		pdf_array_push(ctx, obj, item);
+		return;
 	}
-	return; /* Can't warn :( */
+	if (i < 0 || i > ARRAY(obj)->len)
+		fz_throw(ctx, FZ_ERROR_GENERIC, "index out of bounds");
+
+	if (!item)
+		item = PDF_OBJ_NULL;
+
+	prepare_object_for_alteration(ctx, obj, item);
+	pdf_drop_obj(ctx, ARRAY(obj)->items[i]);
+	ARRAY(obj)->items[i] = pdf_keep_obj(ctx, item);
 }
 
 void
 pdf_array_put_drop(fz_context *ctx, pdf_obj *obj, int i, pdf_obj *item)
 {
-	pdf_array_put(ctx, obj, i, item);
-	pdf_drop_obj(ctx, item);
+	fz_try(ctx)
+		pdf_array_put(ctx, obj, i, item);
+	fz_always(ctx)
+		pdf_drop_obj(ctx, item);
+	fz_catch(ctx)
+		fz_rethrow(ctx);
 }
 
 void
 pdf_array_push(fz_context *ctx, pdf_obj *obj, pdf_obj *item)
 {
 	RESOLVE(obj);
-	if (obj >= PDF_OBJ__LIMIT)
-	{
-		prepare_object_for_alteration(ctx, obj, item);
+	if (!OBJ_IS_ARRAY(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not an array (%s)", pdf_objkindstr(obj));
 
-		if (obj->kind != PDF_ARRAY)
-			fz_warn(ctx, "assert: not an array (%s)", pdf_objkindstr(obj));
-		else
-		{
-			if (ARRAY(obj)->len + 1 > ARRAY(obj)->cap)
-				pdf_array_grow(ctx, ARRAY(obj));
-			ARRAY(obj)->items[ARRAY(obj)->len] = pdf_keep_obj(ctx, item);
-			ARRAY(obj)->len++;
-		}
-	}
-	return; /* Can't warn :( */
+	if (!item)
+		item = PDF_OBJ_NULL;
+
+	prepare_object_for_alteration(ctx, obj, item);
+	if (ARRAY(obj)->len + 1 > ARRAY(obj)->cap)
+		pdf_array_grow(ctx, ARRAY(obj));
+	ARRAY(obj)->items[ARRAY(obj)->len] = pdf_keep_obj(ctx, item);
+	ARRAY(obj)->len++;
 }
 
 void
@@ -729,24 +743,20 @@ void
 pdf_array_insert(fz_context *ctx, pdf_obj *obj, pdf_obj *item, int i)
 {
 	RESOLVE(obj);
-	if (obj >= PDF_OBJ__LIMIT)
-	{
-		prepare_object_for_alteration(ctx, obj, item);
+	if (!OBJ_IS_ARRAY(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not an array (%s)", pdf_objkindstr(obj));
+	if (i < 0 || i > ARRAY(obj)->len)
+		fz_throw(ctx, FZ_ERROR_GENERIC, "index out of bounds");
 
-		if (obj->kind != PDF_ARRAY)
-			fz_warn(ctx, "assert: not an array (%s)", pdf_objkindstr(obj));
-		else
-		{
-			if (i < 0 || i > ARRAY(obj)->len)
-				fz_throw(ctx, FZ_ERROR_GENERIC, "attempt to insert object %d in array of length %d", i, ARRAY(obj)->len);
-			if (ARRAY(obj)->len + 1 > ARRAY(obj)->cap)
-				pdf_array_grow(ctx, ARRAY(obj));
-			memmove(ARRAY(obj)->items + i + 1, ARRAY(obj)->items + i, (ARRAY(obj)->len - i) * sizeof(pdf_obj*));
-			ARRAY(obj)->items[i] = pdf_keep_obj(ctx, item);
-			ARRAY(obj)->len++;
-		}
-	}
-	return; /* Can't warn :( */
+	if (!item)
+		item = PDF_OBJ_NULL;
+
+	prepare_object_for_alteration(ctx, obj, item);
+	if (ARRAY(obj)->len + 1 > ARRAY(obj)->cap)
+		pdf_array_grow(ctx, ARRAY(obj));
+	memmove(ARRAY(obj)->items + i + 1, ARRAY(obj)->items + i, (ARRAY(obj)->len - i) * sizeof(pdf_obj*));
+	ARRAY(obj)->items[i] = pdf_keep_obj(ctx, item);
+	ARRAY(obj)->len++;
 }
 
 void
@@ -768,19 +778,16 @@ void
 pdf_array_delete(fz_context *ctx, pdf_obj *obj, int i)
 {
 	RESOLVE(obj);
-	if (obj >= PDF_OBJ__LIMIT)
-	{
-		if (obj->kind != PDF_ARRAY)
-			fz_warn(ctx, "assert: not an array (%s)", pdf_objkindstr(obj));
-		else
-		{
-			pdf_drop_obj(ctx, ARRAY(obj)->items[i]);
-			ARRAY(obj)->items[i] = 0;
-			ARRAY(obj)->len--;
-			memmove(ARRAY(obj)->items + i, ARRAY(obj)->items + i + 1, (ARRAY(obj)->len - i) * sizeof(pdf_obj*));
-		}
-	}
-	return; /* Can't warn :( */
+	if (!OBJ_IS_ARRAY(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not an array (%s)", pdf_objkindstr(obj));
+	if (i < 0 || i >= ARRAY(obj)->len)
+		fz_throw(ctx, FZ_ERROR_GENERIC, "index out of bounds");
+
+	prepare_object_for_alteration(ctx, obj, NULL);
+	pdf_drop_obj(ctx, ARRAY(obj)->items[i]);
+	ARRAY(obj)->items[i] = 0;
+	ARRAY(obj)->len--;
+	memmove(ARRAY(obj)->items + i, ARRAY(obj)->items + i + 1, (ARRAY(obj)->len - i) * sizeof(pdf_obj*));
 }
 
 int
@@ -796,40 +803,34 @@ pdf_array_contains(fz_context *ctx, pdf_obj *arr, pdf_obj *obj)
 	return 0;
 }
 
+int
+pdf_array_find(fz_context *ctx, pdf_obj *arr, pdf_obj *obj)
+{
+	int i, len;
+
+	len = pdf_array_len(ctx, arr);
+	for (i = 0; i < len; i++)
+		if (!pdf_objcmp(ctx, pdf_array_get(ctx, arr, i), obj))
+			return i;
+
+	return -1;
+}
+
 pdf_obj *pdf_new_rect(fz_context *ctx, pdf_document *doc, const fz_rect *rect)
 {
-	pdf_obj *arr = NULL;
-	pdf_obj *item = NULL;
+	pdf_obj *arr;
 
-	fz_var(arr);
-	fz_var(item);
+	arr = pdf_new_array(ctx, doc, 4);
+
 	fz_try(ctx)
 	{
-		arr = pdf_new_array(ctx, doc, 4);
-
-		item = pdf_new_real(ctx, doc, rect->x0);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
-
-		item = pdf_new_real(ctx, doc, rect->y0);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
-
-		item = pdf_new_real(ctx, doc, rect->x1);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
-
-		item = pdf_new_real(ctx, doc, rect->y1);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, rect->x0));
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, rect->y0));
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, rect->x1));
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, rect->y1));
 	}
 	fz_catch(ctx)
 	{
-		pdf_drop_obj(ctx, item);
 		pdf_drop_obj(ctx, arr);
 		fz_rethrow(ctx);
 	}
@@ -839,48 +840,21 @@ pdf_obj *pdf_new_rect(fz_context *ctx, pdf_document *doc, const fz_rect *rect)
 
 pdf_obj *pdf_new_matrix(fz_context *ctx, pdf_document *doc, const fz_matrix *mtx)
 {
-	pdf_obj *arr = NULL;
-	pdf_obj *item = NULL;
+	pdf_obj *arr;
 
-	fz_var(arr);
-	fz_var(item);
+	arr = pdf_new_array(ctx, doc, 6);
+
 	fz_try(ctx)
 	{
-		arr = pdf_new_array(ctx, doc, 6);
-
-		item = pdf_new_real(ctx, doc, mtx->a);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
-
-		item = pdf_new_real(ctx, doc, mtx->b);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
-
-		item = pdf_new_real(ctx, doc, mtx->c);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
-
-		item = pdf_new_real(ctx, doc, mtx->d);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
-
-		item = pdf_new_real(ctx, doc, mtx->e);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
-
-		item = pdf_new_real(ctx, doc, mtx->f);
-		pdf_array_push(ctx, arr, item);
-		pdf_drop_obj(ctx, item);
-		item = NULL;
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, mtx->a));
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, mtx->b));
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, mtx->c));
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, mtx->d));
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, mtx->e));
+		pdf_array_push_drop(ctx, arr, pdf_new_real(ctx, doc, mtx->f));
 	}
 	fz_catch(ctx)
 	{
-		pdf_drop_obj(ctx, item);
 		pdf_drop_obj(ctx, arr);
 		fz_rethrow(ctx);
 	}
@@ -969,32 +943,34 @@ pdf_dict_grow(fz_context *ctx, pdf_obj *obj)
 pdf_obj *
 pdf_copy_dict(fz_context *ctx, pdf_obj *obj)
 {
+	pdf_document *doc;
 	pdf_obj *dict;
 	int i, n;
 
 	RESOLVE(obj);
-	if (obj >= PDF_OBJ__LIMIT)
-	{
-		pdf_document *doc = DICT(obj)->doc;
+	if (!OBJ_IS_DICT(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dict (%s)", pdf_objkindstr(obj));
 
-		if (obj->kind != PDF_DICT)
-			fz_warn(ctx, "assert: not a dict (%s)", pdf_objkindstr(obj));
-
-		n = pdf_dict_len(ctx, obj);
-		dict = pdf_new_dict(ctx, doc, n);
+	doc = DICT(obj)->doc;
+	n = pdf_dict_len(ctx, obj);
+	dict = pdf_new_dict(ctx, doc, n);
+	fz_try(ctx)
 		for (i = 0; i < n; i++)
 			pdf_dict_put(ctx, dict, pdf_dict_get_key(ctx, obj, i), pdf_dict_get_val(ctx, obj, i));
-
-		return dict;
+	fz_catch(ctx)
+	{
+		pdf_drop_obj(ctx, dict);
+		fz_rethrow(ctx);
 	}
-	return NULL; /* Can't warn :( */
+
+	return dict;
 }
 
 int
 pdf_dict_len(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
+	if (!OBJ_IS_DICT(obj))
 		return 0;
 	return DICT(obj)->len;
 }
@@ -1003,7 +979,7 @@ pdf_obj *
 pdf_dict_get_key(fz_context *ctx, pdf_obj *obj, int i)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
+	if (!OBJ_IS_DICT(obj))
 		return NULL;
 	if (i < 0 || i >= DICT(obj)->len)
 		return NULL;
@@ -1014,7 +990,7 @@ pdf_obj *
 pdf_dict_get_val(fz_context *ctx, pdf_obj *obj, int i)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
+	if (!OBJ_IS_DICT(obj))
 		return NULL;
 	if (i < 0 || i >= DICT(obj)->len)
 		return NULL;
@@ -1022,22 +998,17 @@ pdf_dict_get_val(fz_context *ctx, pdf_obj *obj, int i)
 }
 
 void
-pdf_dict_put_val_drop(fz_context *ctx, pdf_obj *obj, int i, pdf_obj *new_obj)
+pdf_dict_put_val_null(fz_context *ctx, pdf_obj *obj, int idx)
 {
 	RESOLVE(obj);
-	if (!obj || obj->kind != PDF_DICT)
-	{
-		pdf_drop_obj(ctx, new_obj);
-		return;
-	}
-	if (i < 0 || i >= DICT(obj)->len)
-	{
-		/* FIXME: Should probably extend the dict here */
-		pdf_drop_obj(ctx, new_obj);
-		return;
-	}
-	pdf_drop_obj(ctx, DICT(obj)->items[i].v);
-	DICT(obj)->items[i].v = new_obj;
+	if (!OBJ_IS_DICT(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dict (%s)", pdf_objkindstr(obj));
+	if (idx < 0 || idx >= DICT(obj)->len)
+		fz_throw(ctx, FZ_ERROR_GENERIC, "index out of bounds");
+
+	prepare_object_for_alteration(ctx, obj, NULL);
+	pdf_drop_obj(ctx, DICT(obj)->items[idx].v);
+	DICT(obj)->items[idx].v = PDF_OBJ_NULL;
 }
 
 /* Returns 0 <= i < len for key found. Returns -1-len < i <= -1 for key
@@ -1140,49 +1111,48 @@ pdf_dict_gets(fz_context *ctx, pdf_obj *obj, const char *key)
 	int i;
 
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
+	if (!OBJ_IS_DICT(obj))
+		return NULL;
+	if (!key)
 		return NULL;
 
 	i = pdf_dict_finds(ctx, obj, key);
 	if (i >= 0)
 		return DICT(obj)->items[i].v;
-
 	return NULL;
 }
 
 pdf_obj *
 pdf_dict_getp(fz_context *ctx, pdf_obj *obj, const char *keys)
 {
+	char buf[256];
+	char *k, *e;
+
 	RESOLVE(obj);
-	if (obj >= PDF_OBJ__LIMIT)
+	if (!OBJ_IS_DICT(obj))
+		return NULL;
+	if (strlen(keys)+1 > 256)
+		fz_throw(ctx, FZ_ERROR_GENERIC, "path too long");
+
+	strcpy(buf, keys);
+
+	e = buf;
+	while (*e && obj)
 	{
-		char buf[256];
-		char *k, *e;
+		k = e;
+		while (*e != '/' && *e != '\0')
+			e++;
 
-		if (strlen(keys)+1 > 256)
-			fz_throw(ctx, FZ_ERROR_GENERIC, "buffer overflow in pdf_dict_getp");
-
-		strcpy(buf, keys);
-
-		e = buf;
-		while (*e && obj)
+		if (*e == '/')
 		{
-			k = e;
-			while (*e != '/' && *e != '\0')
-				e++;
-
-			if (*e == '/')
-			{
-				*e = '\0';
-				e++;
-			}
-
-			obj = pdf_dict_gets(ctx, obj, k);
+			*e = '\0';
+			e++;
 		}
 
-		return obj;
+		obj = pdf_dict_gets(ctx, obj, k);
 	}
-	return NULL; /* Can't warn */
+
+	return obj;
 }
 
 pdf_obj *
@@ -1208,10 +1178,12 @@ pdf_dict_get(fz_context *ctx, pdf_obj *obj, pdf_obj *key)
 	int i;
 
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
+	if (!OBJ_IS_DICT(obj))
+		return NULL;
+	if (!OBJ_IS_NAME(key))
 		return NULL;
 
-	if (key < PDF_OBJ__LIMIT)
+	if (key < PDF_OBJ_NAME__LIMIT)
 		i = pdf_dict_find(ctx, obj, key);
 	else
 		i = pdf_dict_finds(ctx, obj, pdf_to_name(ctx, key));
@@ -1240,75 +1212,84 @@ pdf_dict_geta(fz_context *ctx, pdf_obj *obj, pdf_obj *key, pdf_obj *abbrev)
 	return pdf_dict_get(ctx, obj, abbrev);
 }
 
+static void
+pdf_dict_get_put(fz_context *ctx, pdf_obj *obj, pdf_obj *key, pdf_obj *val, pdf_obj **old_val)
+{
+	int i;
+
+	if (old_val)
+		*old_val = NULL;
+
+	RESOLVE(obj);
+	if (!OBJ_IS_DICT(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dict (%s)", pdf_objkindstr(obj));
+	if (!OBJ_IS_NAME(key))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "key is not a name (%s)", pdf_objkindstr(obj));
+
+	if (!val)
+		val = PDF_OBJ_NULL;
+
+	if (DICT(obj)->len > 100 && !(obj->flags & PDF_FLAGS_SORTED))
+		pdf_sort_dict(ctx, obj);
+
+	if (key < PDF_OBJ_NAME__LIMIT)
+		i = pdf_dict_find(ctx, obj, key);
+	else
+		i = pdf_dict_finds(ctx, obj, pdf_to_name(ctx, key));
+
+	prepare_object_for_alteration(ctx, obj, val);
+
+	if (i >= 0 && i < DICT(obj)->len)
+	{
+		if (DICT(obj)->items[i].v != val)
+		{
+			pdf_obj *d = DICT(obj)->items[i].v;
+			DICT(obj)->items[i].v = pdf_keep_obj(ctx, val);
+			if (old_val)
+				*old_val = d;
+			else
+				pdf_drop_obj(ctx, d);
+		}
+	}
+	else
+	{
+		if (DICT(obj)->len + 1 > DICT(obj)->cap)
+			pdf_dict_grow(ctx, obj);
+
+		i = -1-i;
+		if ((obj->flags & PDF_FLAGS_SORTED) && DICT(obj)->len > 0)
+			memmove(&DICT(obj)->items[i + 1],
+					&DICT(obj)->items[i],
+					(DICT(obj)->len - i) * sizeof(struct keyval));
+
+		DICT(obj)->items[i].k = pdf_keep_obj(ctx, key);
+		DICT(obj)->items[i].v = pdf_keep_obj(ctx, val);
+		DICT(obj)->len ++;
+	}
+}
+
 void
 pdf_dict_put(fz_context *ctx, pdf_obj *obj, pdf_obj *key, pdf_obj *val)
 {
-	RESOLVE(obj);
-	if (obj >= PDF_OBJ__LIMIT)
-	{
-		int i;
-
-		if (obj->kind != PDF_DICT)
-		{
-			fz_warn(ctx, "assert: not a dict (%s)", pdf_objkindstr(obj));
-			return;
-		}
-
-		RESOLVE(key);
-		if (!key || (key >= PDF_OBJ__LIMIT && key->kind != PDF_NAME))
-		{
-			fz_warn(ctx, "assert: key is not a name (%s)", pdf_objkindstr(obj));
-			return;
-		}
-
-		if (!val)
-		{
-			fz_warn(ctx, "assert: val does not exist for key (%s)", pdf_to_name(ctx, key));
-			return;
-		}
-
-		prepare_object_for_alteration(ctx, obj, val);
-
-		if (DICT(obj)->len > 100 && !(obj->flags & PDF_FLAGS_SORTED))
-			pdf_sort_dict(ctx, obj);
-
-		if (key < PDF_OBJ__LIMIT)
-			i = pdf_dict_find(ctx, obj, key);
-		else
-			i = pdf_dict_finds(ctx, obj, pdf_to_name(ctx, key));
-		if (i >= 0 && i < DICT(obj)->len)
-		{
-			if (DICT(obj)->items[i].v != val)
-			{
-				pdf_obj *d = DICT(obj)->items[i].v;
-				DICT(obj)->items[i].v = pdf_keep_obj(ctx, val);
-				pdf_drop_obj(ctx, d);
-			}
-		}
-		else
-		{
-			if (DICT(obj)->len + 1 > DICT(obj)->cap)
-				pdf_dict_grow(ctx, obj);
-
-			i = -1-i;
-			if ((obj->flags & PDF_FLAGS_SORTED) && DICT(obj)->len > 0)
-				memmove(&DICT(obj)->items[i + 1],
-						&DICT(obj)->items[i],
-						(DICT(obj)->len - i) * sizeof(struct keyval));
-
-			DICT(obj)->items[i].k = pdf_keep_obj(ctx, key);
-			DICT(obj)->items[i].v = pdf_keep_obj(ctx, val);
-			DICT(obj)->len ++;
-		}
-	}
-	return; /* Can't warn :( */
+	pdf_dict_get_put(ctx, obj, key, val, NULL);
 }
 
 void
 pdf_dict_put_drop(fz_context *ctx, pdf_obj *obj, pdf_obj *key, pdf_obj *val)
 {
 	fz_try(ctx)
-		pdf_dict_put(ctx, obj, key, val);
+		pdf_dict_get_put(ctx, obj, key, val, NULL);
+	fz_always(ctx)
+		pdf_drop_obj(ctx, val);
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+}
+
+void
+pdf_dict_get_put_drop(fz_context *ctx, pdf_obj *obj, pdf_obj *key, pdf_obj *val, pdf_obj **old_val)
+{
+	fz_try(ctx)
+		pdf_dict_get_put(ctx, obj, key, val, old_val);
 	fz_always(ctx)
 		pdf_drop_obj(ctx, val);
 	fz_catch(ctx)
@@ -1322,8 +1303,8 @@ pdf_dict_puts(fz_context *ctx, pdf_obj *obj, const char *key, pdf_obj *val)
 	pdf_obj *keyobj;
 
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
-		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dictionary (%s)", pdf_objkindstr(obj));
+	if (!OBJ_IS_DICT(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dict (%s)", pdf_objkindstr(obj));
 
 	doc = DICT(obj)->doc;
 	keyobj = pdf_new_name(ctx, doc, key);
@@ -1343,8 +1324,8 @@ pdf_dict_puts_drop(fz_context *ctx, pdf_obj *obj, const char *key, pdf_obj *val)
 	pdf_obj *keyobj;
 
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
-		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dictionary (%s)", pdf_objkindstr(obj));
+	if (!OBJ_IS_DICT(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dict (%s)", pdf_objkindstr(obj));
 
 	doc = DICT(obj)->doc;
 	keyobj = pdf_new_name(ctx, doc, key);
@@ -1373,14 +1354,12 @@ pdf_dict_putp(fz_context *ctx, pdf_obj *obj, const char *keys, pdf_obj *val)
 	pdf_obj *cobj = NULL;
 
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
-		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dictionary (%s)", pdf_objkindstr(obj));
-
-	doc = DICT(obj)->doc;
-
+	if (!OBJ_IS_DICT(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dict (%s)", pdf_objkindstr(obj));
 	if (strlen(keys)+1 > 256)
 		fz_throw(ctx, FZ_ERROR_GENERIC, "buffer overflow in pdf_dict_putp");
 
+	doc = DICT(obj)->doc;
 	strcpy(buf, keys);
 
 	e = buf;
@@ -1445,8 +1424,8 @@ pdf_dict_vputl(fz_context *ctx, pdf_obj *obj, pdf_obj *val, va_list keys)
 	pdf_document *doc;
 
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
-		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dictionary (%s)", pdf_objkindstr(obj));
+	if (!OBJ_IS_DICT(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dict (%s)", pdf_objkindstr(obj));
 
 	doc = DICT(obj)->doc;
 
@@ -1515,48 +1494,43 @@ pdf_dict_putl_drop(fz_context *ctx, pdf_obj *obj, pdf_obj *val, ...)
 void
 pdf_dict_dels(fz_context *ctx, pdf_obj *obj, const char *key)
 {
-	RESOLVE(obj);
-	if (obj >= PDF_OBJ__LIMIT)
-	{
-		prepare_object_for_alteration(ctx, obj, NULL);
+	int i;
 
-		if (obj->kind != PDF_DICT)
-			fz_warn(ctx, "assert: not a dict (%s)", pdf_objkindstr(obj));
-		else
-		{
-			int i = pdf_dict_finds(ctx, obj, key);
-			if (i >= 0)
-			{
-				pdf_drop_obj(ctx, DICT(obj)->items[i].k);
-				pdf_drop_obj(ctx, DICT(obj)->items[i].v);
-				obj->flags &= ~PDF_FLAGS_SORTED;
-				DICT(obj)->items[i] = DICT(obj)->items[DICT(obj)->len-1];
-				DICT(obj)->len --;
-			}
-		}
+	RESOLVE(obj);
+	if (!OBJ_IS_DICT(obj))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "not a dict (%s)", pdf_objkindstr(obj));
+	if (!key)
+		fz_throw(ctx, FZ_ERROR_GENERIC, "key is null");
+
+	prepare_object_for_alteration(ctx, obj, NULL);
+	i = pdf_dict_finds(ctx, obj, key);
+	if (i >= 0)
+	{
+		pdf_drop_obj(ctx, DICT(obj)->items[i].k);
+		pdf_drop_obj(ctx, DICT(obj)->items[i].v);
+		obj->flags &= ~PDF_FLAGS_SORTED;
+		DICT(obj)->items[i] = DICT(obj)->items[DICT(obj)->len-1];
+		DICT(obj)->len --;
 	}
-	return; /* Can't warn :( */
 }
 
 void
 pdf_dict_del(fz_context *ctx, pdf_obj *obj, pdf_obj *key)
 {
-	RESOLVE(key);
-	if (!key)
-		return; /* Can't warn */
+	if (!OBJ_IS_NAME(key))
+		fz_throw(ctx, FZ_ERROR_GENERIC, "key is not a name (%s)", pdf_objkindstr(key));
 
-	if (key < PDF_OBJ__LIMIT)
+	if (key < PDF_OBJ_NAME__LIMIT)
 		pdf_dict_dels(ctx, obj, PDF_NAMES[(intptr_t)key]);
-	else if (key->kind == PDF_NAME)
+	else
 		pdf_dict_dels(ctx, obj, NAME(key)->n);
-	/* else Can't warn */
 }
 
 void
 pdf_sort_dict(fz_context *ctx, pdf_obj *obj)
 {
 	RESOLVE(obj);
-	if (obj < PDF_OBJ__LIMIT || obj->kind != PDF_DICT)
+	if (!OBJ_IS_DICT(obj))
 		return;
 	if (!(obj->flags & PDF_FLAGS_SORTED))
 	{
@@ -1579,11 +1553,16 @@ pdf_deep_copy_obj(fz_context *ctx, pdf_obj *obj)
 		pdf_obj *dict = pdf_new_dict(ctx, doc, n);
 		int i;
 
-		for (i = 0; i < n; i++)
+		fz_try(ctx)
+			for (i = 0; i < n; i++)
+			{
+				pdf_obj *obj_copy = pdf_deep_copy_obj(ctx, pdf_dict_get_val(ctx, obj, i));
+				pdf_dict_put_drop(ctx, dict, pdf_dict_get_key(ctx, obj, i), obj_copy);
+			}
+		fz_catch(ctx)
 		{
-			pdf_obj *obj_copy = pdf_deep_copy_obj(ctx, pdf_dict_get_val(ctx, obj, i));
-			pdf_dict_put(ctx, dict, pdf_dict_get_key(ctx, obj, i), obj_copy);
-			pdf_drop_obj(ctx, obj_copy);
+			pdf_drop_obj(ctx, dict);
+			fz_rethrow(ctx);
 		}
 
 		return dict;
@@ -1595,11 +1574,16 @@ pdf_deep_copy_obj(fz_context *ctx, pdf_obj *obj)
 		pdf_obj *arr = pdf_new_array(ctx, doc, n);
 		int i;
 
-		for (i = 0; i < n; i++)
+		fz_try(ctx)
+			for (i = 0; i < n; i++)
+			{
+				pdf_obj *obj_copy = pdf_deep_copy_obj(ctx, pdf_array_get(ctx, obj, i));
+				pdf_array_push_drop(ctx, arr, obj_copy);
+			}
+		fz_catch(ctx)
 		{
-			pdf_obj *obj_copy = pdf_deep_copy_obj(ctx, pdf_array_get(ctx, obj, i));
-			pdf_array_push(ctx, arr, obj_copy);
-			pdf_drop_obj(ctx, obj_copy);
+			pdf_drop_obj(ctx, arr);
+			fz_rethrow(ctx);
 		}
 
 		return arr;
@@ -1641,26 +1625,28 @@ pdf_unmark_obj(fz_context *ctx, pdf_obj *obj)
 }
 
 void
-pdf_set_obj_memo(fz_context *ctx, pdf_obj *obj, int memo)
+pdf_set_obj_memo(fz_context *ctx, pdf_obj *obj, int bit, int memo)
 {
 	if (obj < PDF_OBJ__LIMIT)
 		return;
 
-	obj->flags |= PDF_FLAGS_MEMO;
+	bit <<= 1;
+	obj->flags |= PDF_FLAGS_MEMO_BASE << bit;
 	if (memo)
-		obj->flags |= PDF_FLAGS_MEMO_BOOL;
+		obj->flags |= PDF_FLAGS_MEMO_BASE_BOOL << bit;
 	else
-		obj->flags &= ~PDF_FLAGS_MEMO_BOOL;
+		obj->flags &= ~(PDF_FLAGS_MEMO_BASE_BOOL << bit);
 }
 
 int
-pdf_obj_memo(fz_context *ctx, pdf_obj *obj, int *memo)
+pdf_obj_memo(fz_context *ctx, pdf_obj *obj, int bit, int *memo)
 {
 	if (obj < PDF_OBJ__LIMIT)
 		return 0;
-	if (!(obj->flags & PDF_FLAGS_MEMO))
+	bit <<= 1;
+	if (!(obj->flags & (PDF_FLAGS_MEMO_BASE<<bit)))
 		return 0;
-	*memo = !!(obj->flags & PDF_FLAGS_MEMO_BOOL);
+	*memo = !!(obj->flags & (PDF_FLAGS_MEMO_BASE_BOOL<<bit));
 	return 1;
 }
 
@@ -1718,15 +1704,15 @@ pdf_drop_obj(fz_context *ctx, pdf_obj *obj)
 {
 	if (obj >= PDF_OBJ__LIMIT)
 	{
-		(void)Memento_dropRef(obj);
-		if (--obj->refs)
-			return;
-		if (obj->kind == PDF_ARRAY)
-			pdf_drop_array(ctx, obj);
-		else if (obj->kind == PDF_DICT)
-			pdf_drop_dict(ctx, obj);
-		else
-			fz_free(ctx, obj);
+		if (fz_drop_imp16(ctx, obj, &obj->refs))
+		{
+			if (obj->kind == PDF_ARRAY)
+				pdf_drop_array(ctx, obj);
+			else if (obj->kind == PDF_DICT)
+				pdf_drop_dict(ctx, obj);
+			else
+				fz_free(ctx, obj);
+		}
 	}
 }
 
@@ -1775,7 +1761,7 @@ int pdf_obj_parent_num(fz_context *ctx, pdf_obj *obj)
 
 pdf_obj *pdf_new_obj_from_str(fz_context *ctx, pdf_document *doc, const char *src)
 {
-	pdf_obj *result;
+	pdf_obj *result = NULL;
 	pdf_lexbuf lexbuf;
 	fz_stream *stream = fz_open_memory(ctx, (unsigned char *)src, strlen(src));
 
@@ -1809,6 +1795,9 @@ struct fmt
 	int col;
 	int sep;
 	int last;
+	pdf_crypt *crypt;
+	int num;
+	int gen;
 };
 
 static void fmt_obj(fz_context *ctx, struct fmt *fmt, pdf_obj *obj);
@@ -1876,13 +1865,11 @@ static inline void fmt_sep(fz_context *ctx, struct fmt *fmt)
 	fmt->sep = 1;
 }
 
-static void fmt_str(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
+static void fmt_str_out(fz_context *ctx, void *fmt_, const unsigned char *s, int n)
 {
-	char *s = pdf_to_str_buf(ctx, obj);
-	int n = pdf_to_str_len(ctx, obj);
+	struct fmt *fmt = (struct fmt *)fmt_;
 	int i, c;
 
-	fmt_putc(ctx, fmt, '(');
 	for (i = 0; i < n; i++)
 	{
 		c = (unsigned char)s[i];
@@ -1911,16 +1898,23 @@ static void fmt_str(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
 		else
 			fmt_putc(ctx, fmt, c);
 	}
+}
+
+static void fmt_str(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
+{
+	unsigned char *s = (unsigned char *)pdf_to_str_buf(ctx, obj);
+	int n = pdf_to_str_len(ctx, obj);
+
+	fmt_putc(ctx, fmt, '(');
+	pdf_encrypt_data(ctx, fmt->crypt, fmt->num, fmt->gen, fmt_str_out, fmt, s, n);
 	fmt_putc(ctx, fmt, ')');
 }
 
-static void fmt_hex(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
+static void fmt_hex_out(fz_context *ctx, void *arg, const unsigned char *s, int n)
 {
-	char *s = pdf_to_str_buf(ctx, obj);
-	int n = pdf_to_str_len(ctx, obj);
+	struct fmt *fmt = (struct fmt *)arg;
 	int i, b, c;
 
-	fmt_putc(ctx, fmt, '<');
 	for (i = 0; i < n; i++) {
 		b = (unsigned char) s[i];
 		c = (b >> 4) & 0x0f;
@@ -1928,6 +1922,15 @@ static void fmt_hex(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
 		c = (b) & 0x0f;
 		fmt_putc(ctx, fmt, c < 0xA ? c + '0' : c + 'A' - 0xA);
 	}
+}
+
+static void fmt_hex(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
+{
+	unsigned char *s = (unsigned char *)pdf_to_str_buf(ctx, obj);
+	int n = pdf_to_str_len(ctx, obj);
+
+	fmt_putc(ctx, fmt, '<');
+	pdf_encrypt_data(ctx, fmt->crypt, fmt->num, fmt->gen, fmt_hex_out, fmt, s, n);
 	fmt_putc(ctx, fmt, '>');
 }
 
@@ -2026,6 +2029,23 @@ static void fmt_dict(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
 	}
 }
 
+static void count_encrypted_data(fz_context *ctx, void *arg, const unsigned char *str, int len)
+{
+	int *encrypted_len = (int *)arg;
+	int added = 0;
+	int i;
+	unsigned char c;
+
+	for (i = 0; i < len; i++) {
+		c = (unsigned char)str[i];
+		if (c != 0 && strchr("()\\\n\r\t\b\f", c))
+			added ++;
+		else if (c < 32 || c >= 127)
+			added += 3;
+	}
+	*encrypted_len += added;
+}
+
 static void fmt_obj(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
 {
 	char buf[256];
@@ -2053,18 +2073,12 @@ static void fmt_obj(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
 	}
 	else if (pdf_is_string(ctx, obj))
 	{
-		char *str = pdf_to_str_buf(ctx, obj);
+		unsigned char *str = (unsigned char *)pdf_to_str_buf(ctx, obj);
 		int len = pdf_to_str_len(ctx, obj);
-		int added = 0;
-		int i, c;
-		for (i = 0; i < len; i++) {
-			c = (unsigned char)str[i];
-			if (c != 0 && strchr("()\\\n\r\t\b\f", c))
-				added ++;
-			else if (c < 32 || c >= 127)
-				added += 3;
-		}
-		if (added < len)
+		int encoded_len = 0;
+
+		pdf_encrypt_data(ctx, fmt->crypt, fmt->num, fmt->gen, count_encrypted_data, &encoded_len, str, len);
+		if (encoded_len < 2*len)
 			fmt_str(ctx, fmt, obj);
 		else
 			fmt_hex(ctx, fmt, obj);
@@ -2080,7 +2094,7 @@ static void fmt_obj(fz_context *ctx, struct fmt *fmt, pdf_obj *obj)
 }
 
 int
-pdf_sprint_obj(fz_context *ctx, char *s, int n, pdf_obj *obj, int tight)
+pdf_sprint_encrypted_obj(fz_context *ctx, char *s, int n, pdf_obj *obj, int tight, pdf_crypt *crypt, int num, int gen)
 {
 	struct fmt fmt;
 
@@ -2093,6 +2107,9 @@ pdf_sprint_obj(fz_context *ctx, char *s, int n, pdf_obj *obj, int tight)
 	fmt.buf = s;
 	fmt.cap = n;
 	fmt.len = 0;
+	fmt.crypt = crypt;
+	fmt.num = num;
+	fmt.gen = gen;
 	fmt_obj(ctx, &fmt, obj);
 
 	if (fmt.buf && fmt.len < fmt.cap)
@@ -2101,7 +2118,39 @@ pdf_sprint_obj(fz_context *ctx, char *s, int n, pdf_obj *obj, int tight)
 	return fmt.len;
 }
 
+int
+pdf_sprint_obj(fz_context *ctx, char *s, int n, pdf_obj *obj, int tight)
+{
+	return pdf_sprint_encrypted_obj(ctx, s, n, obj, tight, NULL, 0, 0);
+}
+
+int pdf_print_encrypted_obj(fz_context *ctx, fz_output *out, pdf_obj *obj, int tight, pdf_crypt *crypt, int num, int gen)
+{
+	char buf[1024];
+	char *ptr;
+	int n;
+
+	n = pdf_sprint_encrypted_obj(ctx, buf, sizeof buf, obj, tight, crypt, num, gen);
+	if (n <= sizeof buf)
+	{
+		fz_write_data(ctx, out, buf, n);
+	}
+	else
+	{
+		ptr = fz_malloc(ctx, n + 1);
+		pdf_sprint_encrypted_obj(ctx, ptr, n + 1, obj, tight, crypt, num, gen);
+		fz_write_data(ctx, out, ptr, n);
+		fz_free(ctx, ptr);
+	}
+	return n;
+}
+
 int pdf_print_obj(fz_context *ctx, fz_output *out, pdf_obj *obj, int tight)
+{
+	return pdf_print_encrypted_obj(ctx, out, obj, tight, NULL, 0, 0);
+}
+
+static int pdf_debug_encrypted_obj(fz_context *ctx, pdf_obj *obj, int tight, pdf_crypt *crypt, int num, int gen)
 {
 	char buf[1024];
 	char *ptr;
@@ -2110,20 +2159,97 @@ int pdf_print_obj(fz_context *ctx, fz_output *out, pdf_obj *obj, int tight)
 	n = pdf_sprint_obj(ctx, NULL, 0, obj, tight);
 	if ((n + 1) < sizeof buf)
 	{
-		pdf_sprint_obj(ctx, buf, sizeof buf, obj, tight);
-		fz_write(ctx, out, buf, n);
+		pdf_sprint_encrypted_obj(ctx, buf, sizeof buf, obj, tight, crypt, num, gen);
+		fwrite(buf, 1, n, stdout);
 	}
 	else
 	{
 		ptr = fz_malloc(ctx, n + 1);
-		pdf_sprint_obj(ctx, ptr, n + 1, obj, tight);
-		fz_write(ctx, out, ptr, n);
+		pdf_sprint_encrypted_obj(ctx, ptr, n + 1, obj, tight, crypt, num, gen);
+		fwrite(ptr, 1, n, stdout);
 		fz_free(ctx, ptr);
 	}
 	return n;
 }
 
+void pdf_debug_obj(fz_context *ctx, pdf_obj *obj)
+{
+	pdf_debug_encrypted_obj(ctx, obj, 0, NULL, 0, 0);
+}
+
 int pdf_obj_refs(fz_context *ctx, pdf_obj *ref)
 {
 	return (ref >= PDF_OBJ__LIMIT ? ref->refs : 0);
+}
+
+/* Convenience functions */
+
+void pdf_dict_put_bool(fz_context *ctx, pdf_obj *dict, pdf_obj *key, int x)
+{
+	pdf_dict_put_drop(ctx, dict, key, pdf_new_bool(ctx, NULL, x));
+}
+
+void pdf_dict_put_int(fz_context *ctx, pdf_obj *dict, pdf_obj *key, int64_t x)
+{
+	pdf_dict_put_drop(ctx, dict, key, pdf_new_int(ctx, NULL, x));
+}
+
+void pdf_dict_put_real(fz_context *ctx, pdf_obj *dict, pdf_obj *key, double x)
+{
+	pdf_dict_put_drop(ctx, dict, key, pdf_new_real(ctx, NULL, x));
+}
+
+void pdf_dict_put_name(fz_context *ctx, pdf_obj *dict, pdf_obj *key, const char *x)
+{
+	pdf_dict_put_drop(ctx, dict, key, pdf_new_name(ctx, NULL, x));
+}
+
+void pdf_dict_put_string(fz_context *ctx, pdf_obj *dict, pdf_obj *key, const char *x, size_t n)
+{
+	pdf_dict_put_drop(ctx, dict, key, pdf_new_string(ctx, NULL, x, n));
+}
+
+void pdf_dict_put_text_string(fz_context *ctx, pdf_obj *dict, pdf_obj *key, const char *x)
+{
+	pdf_dict_put_drop(ctx, dict, key, pdf_new_text_string(ctx, NULL, x));
+}
+
+void pdf_dict_put_rect(fz_context *ctx, pdf_obj *dict, pdf_obj *key, const fz_rect *x)
+{
+	pdf_dict_put_drop(ctx, dict, key, pdf_new_rect(ctx, NULL, x));
+}
+
+void pdf_dict_put_matrix(fz_context *ctx, pdf_obj *dict, pdf_obj *key, const fz_matrix *x)
+{
+	pdf_dict_put_drop(ctx, dict, key, pdf_new_matrix(ctx, NULL, x));
+}
+
+void pdf_array_push_bool(fz_context *ctx, pdf_obj *array, int x)
+{
+	pdf_array_push_drop(ctx, array, pdf_new_bool(ctx, NULL, x));
+}
+
+void pdf_array_push_int(fz_context *ctx, pdf_obj *array, int64_t x)
+{
+	pdf_array_push_drop(ctx, array, pdf_new_int(ctx, NULL, x));
+}
+
+void pdf_array_push_real(fz_context *ctx, pdf_obj *array, double x)
+{
+	pdf_array_push_drop(ctx, array, pdf_new_real(ctx, NULL, x));
+}
+
+void pdf_array_push_name(fz_context *ctx, pdf_obj *array, const char *x)
+{
+	pdf_array_push_drop(ctx, array, pdf_new_name(ctx, NULL, x));
+}
+
+void pdf_array_push_string(fz_context *ctx, pdf_obj *array, const char *x, size_t n)
+{
+	pdf_array_push_drop(ctx, array, pdf_new_string(ctx, NULL, x, n));
+}
+
+void pdf_array_push_text_string(fz_context *ctx, pdf_obj *array, const char *x)
+{
+	pdf_array_push_drop(ctx, array, pdf_new_text_string(ctx, NULL, x));
 }

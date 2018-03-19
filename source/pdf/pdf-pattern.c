@@ -1,3 +1,4 @@
+#include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
 
 pdf_pattern *
@@ -16,10 +17,8 @@ static void
 pdf_drop_pattern_imp(fz_context *ctx, fz_storable *pat_)
 {
 	pdf_pattern *pat = (pdf_pattern *)pat_;
-	if (pat->resources)
-		pdf_drop_obj(ctx, pat->resources);
-	if (pat->contents)
-		pdf_drop_obj(ctx, pat->contents);
+	pdf_drop_obj(ctx, pat->resources);
+	pdf_drop_obj(ctx, pat->contents);
 	fz_free(ctx, pat);
 }
 
@@ -47,6 +46,7 @@ pdf_load_pattern(fz_context *ctx, pdf_document *doc, pdf_obj *dict)
 	pat->document = doc;
 	pat->resources = NULL;
 	pat->contents = NULL;
+	pat->id = pdf_to_num(ctx, dict);
 
 	fz_try(ctx)
 	{

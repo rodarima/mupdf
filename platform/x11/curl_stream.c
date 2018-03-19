@@ -1,6 +1,10 @@
 /* Simple example fz_stream implementation using curl */
 
 #include "mupdf/fitz.h"
+
+#include <string.h>
+#include <stdlib.h>
+
 #include "curl_stream.h"
 
 #define CURL_STATICLIB
@@ -301,7 +305,7 @@ fetch_chunk(curl_stream_state *state)
 		state->complete = 1;
 	if (state->content_length > 0 && end >= state->content_length)
 		end = state->content_length-1;
-	snprintf(text, 32, "%d-%d", start, end);
+	fz_snprintf(text, 32, "%d-%d", start, end);
 	curl_easy_setopt(state->handle, CURLOPT_RANGE, text);
 	ret = curl_easy_perform(state->handle);
 	if (ret != CURLE_OK)
@@ -316,13 +320,13 @@ fetcher_thread(curl_stream_state *state)
 }
 
 static int
-stream_next(fz_context *ctx, fz_stream *stream, int len)
+stream_next(fz_context *ctx, fz_stream *stream, size_t len)
 {
 	curl_stream_state *state = (curl_stream_state *)stream->state;
-	int len_read = 0;
-	int read_point = stream->pos;
+	size_t len_read = 0;
+	int64_t read_point = stream->pos;
 	int block = read_point>>BLOCK_SHIFT;
-	int left_over = (-read_point) & (BLOCK_SIZE-1);
+	size_t left_over = (-read_point) & (BLOCK_SIZE-1);
 	unsigned char *buf = state->public_buffer;
 
 	if (state->error != NULL)
@@ -332,7 +336,7 @@ stream_next(fz_context *ctx, fz_stream *stream, int len)
 		len = sizeof(state->public_buffer);
 
 	if (state->content_length == 0)
-		fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (A) (offset=%d)", read_point);
+		fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (A) (offset=%ld)", read_point);
 
 	if (state->map == NULL)
 	{
@@ -341,7 +345,7 @@ stream_next(fz_context *ctx, fz_stream *stream, int len)
 		if (read_point + len > state->current_fill_point)
 		{
 			stream->rp = stream->wp;
-			fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (B) (offset=%d)", read_point);
+			fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (B) (offset=%ld)", read_point);
 		}
 		memcpy(buf, state->buffer + read_point, len);
 		stream->rp = buf;
@@ -366,7 +370,7 @@ stream_next(fz_context *ctx, fz_stream *stream, int len)
 			state->fill_point = block;
 			unlock(state);
 			stream->rp = stream->wp;
-			fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (C) (offset=%d)", read_point);
+			fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (C) (offset=%ld)", read_point);
 		}
 		block++;
 		if (left_over > len)
@@ -387,7 +391,7 @@ stream_next(fz_context *ctx, fz_stream *stream, int len)
 			state->fill_point = block;
 			unlock(state);
 			stream->rp = stream->wp;
-			fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (D) (offset=%d)", read_point);
+			fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (D) (offset=%ld)", read_point);
 		}
 		block++;
 		memcpy(buf, state->buffer + read_point, BLOCK_SIZE);
@@ -406,7 +410,7 @@ stream_next(fz_context *ctx, fz_stream *stream, int len)
 			state->fill_point = block;
 			unlock(state);
 			stream->rp = stream->wp;
-			fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (E) (offset=%d)", read_point);
+			fz_throw(ctx, FZ_ERROR_TRYLATER, "read of a block we don't have (E) (offset=%ld)", read_point);
 		}
 		memcpy(buf, state->buffer + read_point, len);
 		len_read += len;
@@ -440,6 +444,8 @@ stream_close(fz_context *ctx, void *state_)
 	pthread_mutex_destroy(&state->mutex);
 #endif
 
+	curl_easy_cleanup(state->handle);
+
 	fz_free(ctx, state->buffer);
 	fz_free(ctx, state->map);
 	fz_free(ctx, state);
@@ -450,7 +456,7 @@ static curl_stream_state hack;
 static int hack_pos;
 
 static void
-stream_seek(fz_context *ctx, fz_stream *stream, fz_off_t offset, int whence)
+stream_seek(fz_context *ctx, fz_stream *stream, int64_t offset, int whence)
 {
 	curl_stream_state *state = (curl_stream_state *)stream->state;
 

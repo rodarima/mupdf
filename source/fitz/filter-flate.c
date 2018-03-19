@@ -2,29 +2,31 @@
 
 #include <zlib.h>
 
-typedef struct fz_flate_s fz_flate;
+#include <string.h>
 
-struct fz_flate_s
+typedef struct fz_inflate_state_s fz_inflate_state;
+
+struct fz_inflate_state_s
 {
 	fz_stream *chain;
 	z_stream z;
 	unsigned char buffer[4096];
 };
 
-static void *zalloc(void *opaque, unsigned int items, unsigned int size)
+static void *zalloc_flate(void *opaque, unsigned int items, unsigned int size)
 {
 	return fz_malloc_array_no_throw(opaque, items, size);
 }
 
-static void zfree(void *opaque, void *ptr)
+static void zfree_flate(void *opaque, void *ptr)
 {
 	fz_free(opaque, ptr);
 }
 
 static int
-next_flated(fz_context *ctx, fz_stream *stm, int required)
+next_flated(fz_context *ctx, fz_stream *stm, size_t required)
 {
-	fz_flate *state = stm->state;
+	fz_inflate_state *state = stm->state;
 	fz_stream *chain = state->chain;
 	z_streamp zp = &state->z;
 	int code;
@@ -39,7 +41,7 @@ next_flated(fz_context *ctx, fz_stream *stm, int required)
 
 	while (zp->avail_out > 0)
 	{
-		zp->avail_in = fz_available(ctx, chain, 1);
+		zp->avail_in = (uInt)fz_available(ctx, chain, 1);
 		zp->next_in = chain->rp;
 
 		code = inflate(zp, Z_SYNC_FLUSH);
@@ -86,7 +88,7 @@ next_flated(fz_context *ctx, fz_stream *stm, int required)
 static void
 close_flated(fz_context *ctx, void *state_)
 {
-	fz_flate *state = (fz_flate *)state_;
+	fz_inflate_state *state = (fz_inflate_state *)state_;
 	int code;
 
 	code = inflateEnd(&state->z);
@@ -100,7 +102,7 @@ close_flated(fz_context *ctx, void *state_)
 fz_stream *
 fz_open_flated(fz_context *ctx, fz_stream *chain, int window_bits)
 {
-	fz_flate *state = NULL;
+	fz_inflate_state *state = NULL;
 	int code = Z_OK;
 
 	fz_var(code);
@@ -108,11 +110,11 @@ fz_open_flated(fz_context *ctx, fz_stream *chain, int window_bits)
 
 	fz_try(ctx)
 	{
-		state = fz_malloc_struct(ctx, fz_flate);
+		state = fz_malloc_struct(ctx, fz_inflate_state);
 		state->chain = chain;
 
-		state->z.zalloc = zalloc;
-		state->z.zfree = zfree;
+		state->z.zalloc = zalloc_flate;
+		state->z.zfree = zfree_flate;
 		state->z.opaque = ctx;
 		state->z.next_in = NULL;
 		state->z.avail_in = 0;

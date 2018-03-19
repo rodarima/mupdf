@@ -1,5 +1,7 @@
 #include "mupdf/fitz.h"
 
+#include <string.h>
+
 typedef struct tiff_document_s tiff_document;
 typedef struct tiff_page_s tiff_page;
 
@@ -19,8 +21,9 @@ struct tiff_document_s
 };
 
 static fz_rect *
-tiff_bound_page(fz_context *ctx, tiff_page *page, fz_rect *bbox)
+tiff_bound_page(fz_context *ctx, fz_page *page_, fz_rect *bbox)
 {
+	tiff_page *page = (tiff_page*)page_;
 	fz_image *image = page->image;
 	int xres, yres;
 
@@ -32,8 +35,9 @@ tiff_bound_page(fz_context *ctx, tiff_page *page, fz_rect *bbox)
 }
 
 static void
-tiff_run_page(fz_context *ctx, tiff_page *page, fz_device *dev, const fz_matrix *ctm, fz_cookie *cookie)
+tiff_run_page(fz_context *ctx, fz_page *page_, fz_device *dev, const fz_matrix *ctm, fz_cookie *cookie)
 {
+	tiff_page *page = (tiff_page*)page_;
 	fz_matrix local_ctm = *ctm;
 	fz_image *image = page->image;
 	int xres, yres;
@@ -43,20 +47,20 @@ tiff_run_page(fz_context *ctx, tiff_page *page, fz_device *dev, const fz_matrix 
 	w = image->w * DPI / xres;
 	h = image->h * DPI / yres;
 	fz_pre_scale(&local_ctm, w, h);
-	fz_fill_image(ctx, dev, image, &local_ctm, 1);
+	fz_fill_image(ctx, dev, image, &local_ctm, 1, NULL);
 }
 
 static void
-tiff_drop_page_imp(fz_context *ctx, tiff_page *page)
+tiff_drop_page(fz_context *ctx, fz_page *page_)
 {
-	if (!page)
-		return;
+	tiff_page *page = (tiff_page*)page_;
 	fz_drop_image(ctx, page->image);
 }
 
-static tiff_page *
-tiff_load_page(fz_context *ctx, tiff_document *doc, int number)
+static fz_page *
+tiff_load_page(fz_context *ctx, fz_document *doc_, int number)
 {
+	tiff_document *doc = (tiff_document*)doc_;
 	fz_pixmap *pixmap = NULL;
 	fz_image *image = NULL;
 	tiff_page *page = NULL;
@@ -70,13 +74,16 @@ tiff_load_page(fz_context *ctx, tiff_document *doc, int number)
 
 	fz_try(ctx)
 	{
-		pixmap = fz_load_tiff_subimage(ctx, doc->buffer->data, doc->buffer->len, number);
+		size_t len;
+		unsigned char *data;
+		len = fz_buffer_storage(ctx, doc->buffer, &data);
+		pixmap = fz_load_tiff_subimage(ctx, data, len, number);
 		image = fz_new_image_from_pixmap(ctx, pixmap, NULL);
 
-		page = fz_new_page(ctx, sizeof *page);
-		page->super.bound_page = (fz_page_bound_page_fn *)tiff_bound_page;
-		page->super.run_page_contents = (fz_page_run_page_contents_fn *)tiff_run_page;
-		page->super.drop_page_imp = (fz_page_drop_page_imp_fn *)tiff_drop_page_imp;
+		page = fz_new_derived_page(ctx, tiff_page);
+		page->super.bound_page = tiff_bound_page;
+		page->super.run_page_contents = tiff_run_page;
+		page->super.drop_page = tiff_drop_page;
 		page->image = fz_keep_image(ctx, image);
 	}
 	fz_always(ctx)
@@ -90,94 +97,79 @@ tiff_load_page(fz_context *ctx, tiff_document *doc, int number)
 		fz_rethrow(ctx);
 	}
 
-	return page;
+	return (fz_page*)page;
 }
 
 static int
-tiff_count_pages(fz_context *ctx, tiff_document *doc)
+tiff_count_pages(fz_context *ctx, fz_document *doc_)
 {
+	tiff_document *doc = (tiff_document*)doc_;
 	return doc->page_count;
 }
 
 static int
-tiff_lookup_metadata(fz_context *ctx, tiff_document *doc, const char *key, char *buf, int size)
+tiff_lookup_metadata(fz_context *ctx, fz_document *doc_, const char *key, char *buf, int size)
 {
 	if (!strcmp(key, "format"))
-		return fz_strlcpy(buf, "TIFF", size);
+		return (int)fz_strlcpy(buf, "TIFF", size);
 	return -1;
 }
 
 static void
-tiff_close_document(fz_context *ctx, tiff_document *doc)
+tiff_drop_document(fz_context *ctx, fz_document *doc_)
 {
+	tiff_document *doc = (tiff_document*)doc_;
 	fz_drop_buffer(ctx, doc->buffer);
-	fz_free(ctx, doc);
 }
 
-static tiff_document *
+static fz_document *
 tiff_open_document_with_stream(fz_context *ctx, fz_stream *file)
 {
 	tiff_document *doc;
 
-	doc = fz_new_document(ctx, tiff_document);
+	doc = fz_new_derived_document(ctx, tiff_document);
 
-	doc->super.close = (fz_document_close_fn *)tiff_close_document;
-	doc->super.count_pages = (fz_document_count_pages_fn *)tiff_count_pages;
-	doc->super.load_page = (fz_document_load_page_fn *)tiff_load_page;
-	doc->super.lookup_metadata = (fz_document_lookup_metadata_fn *)tiff_lookup_metadata;
+	doc->super.drop_document = tiff_drop_document;
+	doc->super.count_pages = tiff_count_pages;
+	doc->super.load_page = tiff_load_page;
+	doc->super.lookup_metadata = tiff_lookup_metadata;
 
 	fz_try(ctx)
 	{
+		size_t len;
+		unsigned char *data;
 		doc->buffer = fz_read_all(ctx, file, 1024);
-		doc->page_count = fz_load_tiff_subimage_count(ctx, doc->buffer->data, doc->buffer->len);
+		len = fz_buffer_storage(ctx, doc->buffer, &data);
+		doc->page_count = fz_load_tiff_subimage_count(ctx, data, len);
 	}
 	fz_catch(ctx)
 	{
-		tiff_close_document(ctx, doc);
+		fz_drop_document(ctx, (fz_document*)doc);
 		fz_rethrow(ctx);
 	}
 
-	return doc;
+	return (fz_document*)doc;
 }
 
-static tiff_document *
-tiff_open_document(fz_context *ctx, const char *filename)
+static const char *tiff_extensions[] =
 {
-	fz_stream *file;
-	tiff_document *doc;
+	"tif",
+	"tiff",
+	NULL
+};
 
-	file = fz_open_file(ctx, filename);
-
-	fz_try(ctx)
-		doc = tiff_open_document_with_stream(ctx, file);
-	fz_always(ctx)
-		fz_drop_stream(ctx, file);
-	fz_catch(ctx)
-		fz_rethrow(ctx);
-
-	return doc;
-}
-
-static int
-tiff_recognize(fz_context *doc, const char *magic)
+static const char *tiff_mimetypes[] =
 {
-	char *ext = strrchr(magic, '.');
-
-	if (ext)
-	{
-		if (!fz_strcasecmp(ext, ".tiff") || !fz_strcasecmp(ext, ".tif"))
-			return 100;
-	}
-	if (!strcmp(magic, "tif") || !strcmp(magic, "image/tiff") ||
-		!strcmp(magic, "tiff") || !strcmp(magic, "image/x-tiff"))
-		return 100;
-
-	return 0;
-}
+	"image/tiff",
+	"image/x-tiff",
+	NULL
+};
 
 fz_document_handler tiff_document_handler =
 {
-	(fz_document_recognize_fn *)&tiff_recognize,
-	(fz_document_open_fn *)&tiff_open_document,
-	(fz_document_open_with_stream_fn *)&tiff_open_document_with_stream
+	NULL,
+	NULL,
+	tiff_open_document_with_stream,
+	tiff_extensions,
+	tiff_mimetypes
 };

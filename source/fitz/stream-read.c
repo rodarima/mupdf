@@ -1,11 +1,13 @@
-#include "mupdf/fitz.h"
+#include "fitz-imp.h"
+
+#include <string.h>
 
 #define MIN_BOMB (100 << 20)
 
-int
-fz_read(fz_context *ctx, fz_stream *stm, unsigned char *buf, int len)
+size_t
+fz_read(fz_context *ctx, fz_stream *stm, unsigned char *buf, size_t len)
 {
-	int count, n;
+	size_t count, n;
 
 	count = 0;
 	do
@@ -29,9 +31,9 @@ fz_read(fz_context *ctx, fz_stream *stm, unsigned char *buf, int len)
 
 static unsigned char skip_buf[4096];
 
-int fz_skip(fz_context *ctx, fz_stream *stm, int len)
+size_t fz_skip(fz_context *ctx, fz_stream *stm, size_t len)
 {
-	int count, l, total = 0;
+	size_t count, l, total = 0;
 
 	while (len)
 	{
@@ -48,16 +50,16 @@ int fz_skip(fz_context *ctx, fz_stream *stm, int len)
 }
 
 fz_buffer *
-fz_read_all(fz_context *ctx, fz_stream *stm, int initial)
+fz_read_all(fz_context *ctx, fz_stream *stm, size_t initial)
 {
 	return fz_read_best(ctx, stm, initial, NULL);
 }
 
 fz_buffer *
-fz_read_best(fz_context *ctx, fz_stream *stm, int initial, int *truncated)
+fz_read_best(fz_context *ctx, fz_stream *stm, size_t initial, int *truncated)
 {
 	fz_buffer *buf = NULL;
-	int n;
+	size_t n;
 
 	fz_var(buf);
 
@@ -110,7 +112,7 @@ fz_read_best(fz_context *ctx, fz_stream *stm, int initial, int *truncated)
 }
 
 char *
-fz_read_line(fz_context *ctx, fz_stream *stm, char *mem, int n)
+fz_read_line(fz_context *ctx, fz_stream *stm, char *mem, size_t n)
 {
 	char *s = mem;
 	int c = EOF;
@@ -135,14 +137,14 @@ fz_read_line(fz_context *ctx, fz_stream *stm, char *mem, int n)
 	return (s == mem && c == EOF) ? NULL : mem;
 }
 
-fz_off_t
+int64_t
 fz_tell(fz_context *ctx, fz_stream *stm)
 {
 	return stm->pos - (stm->wp - stm->rp);
 }
 
 void
-fz_seek(fz_context *ctx, fz_stream *stm, fz_off_t offset, int whence)
+fz_seek(fz_context *ctx, fz_stream *stm, int64_t offset, int whence)
 {
 	stm->avail = 0; /* Reset bit reading */
 	if (stm->seek)

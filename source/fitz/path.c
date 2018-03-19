@@ -1,4 +1,8 @@
 #include "mupdf/fitz.h"
+#include "fitz-imp.h"
+
+#include <string.h>
+#include <assert.h>
 
 // Thoughts for further optimisations:
 // All paths start with MoveTo. We could probably avoid most cases where
@@ -541,6 +545,7 @@ fz_closepath(fz_context *ctx, fz_path *path)
 	case FZ_QUADTOCLOSE:
 		/* CLOSE following a CLOSE is a NOP */
 		return;
+	default: /* default never happens */
 	case 0:
 		/* Closing an empty path is a NOP */
 		return;
@@ -1342,81 +1347,6 @@ void fz_trim_path(fz_context *ctx, fz_path *path)
 	}
 }
 
-void
-fz_print_path(fz_context *ctx, fz_output *out, fz_path *path, int indent)
-{
-	float x, y;
-	int i = 0, k = 0;
-	int n;
-	while (i < path->cmd_len)
-	{
-		uint8_t cmd = path->cmds[i++];
-
-		for (n = 0; n < indent; n++)
-			fz_putc(ctx, out, ' ');
-		switch (cmd)
-		{
-		case FZ_MOVETO:
-		case FZ_MOVETOCLOSE:
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g m%s\n", x, y, cmd == FZ_MOVETOCLOSE ? " z" : "");
-			break;
-		case FZ_LINETO:
-		case FZ_LINETOCLOSE:
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g l%s\n", x, y, cmd == FZ_LINETOCLOSE ? " z" : "");
-			break;
-		case FZ_DEGENLINETO:
-		case FZ_DEGENLINETOCLOSE:
-			fz_printf(ctx, out, "d%s\n", cmd == FZ_DEGENLINETOCLOSE ? " z" : "");
-			break;
-		case FZ_HORIZTO:
-		case FZ_HORIZTOCLOSE:
-			x = path->coords[k++];
-			fz_printf(ctx, out, "%g h%s\n", x, cmd == FZ_HORIZTOCLOSE ? " z" : "");
-			break;
-		case FZ_VERTTOCLOSE:
-		case FZ_VERTTO:
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g i%s\n", y, cmd == FZ_VERTTOCLOSE ? " z" : "");
-			break;
-		case FZ_CURVETOCLOSE:
-		case FZ_CURVETO:
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g ", x, y);
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g ", x, y);
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g c%s\n", x, y, cmd == FZ_CURVETOCLOSE ? " z" : "");
-			break;
-		case FZ_CURVETOVCLOSE:
-		case FZ_CURVETOV:
-		case FZ_CURVETOYCLOSE:
-		case FZ_CURVETOY:
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g ", x, y);
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g %c%s\n", x, y, (cmd == FZ_CURVETOVCLOSE || cmd == FZ_CURVETOV ? 'v' : 'y'), (cmd == FZ_CURVETOVCLOSE || cmd == FZ_CURVETOYCLOSE) ? " z" : "");
-			break;
-		case FZ_RECTTO:
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g ", x, y);
-			x = path->coords[k++];
-			y = path->coords[k++];
-			fz_printf(ctx, out, "%g %g r\n", x, y);
-			break;
-		}
-	}
-}
-
 const fz_stroke_state fz_default_stroke_state = {
 	-2, /* -2 is the magic number we use when we have stroke states stored on the stack */
 	FZ_LINECAP_BUTT, FZ_LINECAP_BUTT, FZ_LINECAP_BUTT,
@@ -1493,7 +1423,7 @@ fz_clone_stroke_state(fz_context *ctx, fz_stroke_state *stroke)
 fz_stroke_state *
 fz_unshare_stroke_state_with_dash_len(fz_context *ctx, fz_stroke_state *shared, int len)
 {
-	int single, unsize, shsize, shlen, drop;
+	int single, unsize, shsize, shlen;
 	fz_stroke_state *unshared;
 
 	fz_lock(ctx, FZ_LOCK_ALLOC);
@@ -1515,10 +1445,7 @@ fz_unshare_stroke_state_with_dash_len(fz_context *ctx, fz_stroke_state *shared, 
 	memcpy(unshared, shared, (shsize > unsize ? unsize : shsize));
 	unshared->refs = 1;
 
-	fz_lock(ctx, FZ_LOCK_ALLOC);
-	drop = (shared->refs > 0 ? --shared->refs == 0 : 0);
-	fz_unlock(ctx, FZ_LOCK_ALLOC);
-	if (drop)
+	if (fz_drop_imp(ctx, shared, &shared->refs))
 		fz_free(ctx, shared);
 	return unshared;
 }
@@ -1549,7 +1476,7 @@ fz_clone_path(fz_context *ctx, fz_path *path)
 
 	assert(ctx != NULL);
 
-	if (ctx == NULL || path == NULL)
+	if (path == NULL)
 		return NULL;
 
 	new_path = fz_malloc_struct(ctx, fz_path);

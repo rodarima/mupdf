@@ -1,5 +1,8 @@
 #include "mupdf/fitz.h"
 
+#include <string.h>
+#include <limits.h>
+
 /* Fax G3/G4 decoder */
 
 /* TODO: uncompressed */
@@ -539,7 +542,7 @@ dec2d(fz_context *ctx, fz_faxd *fax)
 }
 
 static int
-next_faxd(fz_context *ctx, fz_stream *stm, int max)
+next_faxd(fz_context *ctx, fz_stream *stm, size_t max)
 {
 	fz_faxd *fax = stm->state;
 	unsigned char *p = fax->buffer;

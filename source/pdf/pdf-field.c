@@ -1,4 +1,7 @@
+#include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+
+#include <string.h>
 
 pdf_obj *pdf_get_inheritable(fz_context *ctx, pdf_document *doc, pdf_obj *obj, pdf_obj *key)
 {
@@ -17,7 +20,7 @@ pdf_obj *pdf_get_inheritable(fz_context *ctx, pdf_document *doc, pdf_obj *obj, p
 
 char *pdf_get_string_or_stream(fz_context *ctx, pdf_document *doc, pdf_obj *obj)
 {
-	int len = 0;
+	size_t len = 0;
 	char *buf = NULL;
 	fz_buffer *stmbuf = NULL;
 	char *text = NULL;
@@ -33,7 +36,7 @@ char *pdf_get_string_or_stream(fz_context *ctx, pdf_document *doc, pdf_obj *obj)
 		}
 		else if (pdf_is_stream(ctx, obj))
 		{
-			stmbuf = pdf_load_stream(ctx, doc, pdf_to_num(ctx, obj), pdf_to_gen(ctx, obj));
+			stmbuf = pdf_load_stream(ctx, obj);
 			len = fz_buffer_storage(ctx, stmbuf, (unsigned char **)&buf);
 		}
 
@@ -146,6 +149,6 @@ void pdf_set_field_type(fz_context *ctx, pdf_document *doc, pdf_obj *obj, int ty
 		int bits = pdf_to_int(ctx, pdf_dict_get(ctx, obj, PDF_NAME_Ff));
 		bits &= ~clearbits;
 		bits |= setbits;
-		pdf_dict_put_drop(ctx, obj, PDF_NAME_Ff, pdf_new_int(ctx, doc, bits));
+		pdf_dict_put_int(ctx, obj, PDF_NAME_Ff, bits);
 	}
 }

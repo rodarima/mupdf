@@ -1,4 +1,8 @@
-#include "mupdf/xps.h"
+#include "mupdf/fitz.h"
+#include "xps-imp.h"
+
+#include <string.h>
+#include <stdlib.h>
 
 /* Quick parsing of document to find links. */
 
@@ -9,23 +13,7 @@ xps_load_links_in_element(fz_context *ctx, xps_document *doc, const fz_matrix *c
 static void
 xps_add_link(fz_context *ctx, xps_document *doc, const fz_rect *area, char *base_uri, char *target_uri, fz_link **head)
 {
-	fz_link_dest dest;
-	fz_link *link;
-
-	memset(&dest, 0, sizeof dest);
-
-	if (xps_url_is_remote(ctx, doc, target_uri))
-	{
-		dest.kind = FZ_LINK_URI;
-		dest.ld.uri.uri = fz_strdup(ctx, target_uri);
-	}
-	else
-	{
-		dest.kind = FZ_LINK_GOTO;
-		dest.ld.gotor.page = xps_lookup_link_target(ctx, doc, target_uri);
-	}
-
-	link = fz_new_link(ctx, area, dest);
+	fz_link *link = fz_new_link(ctx, area, doc, target_uri);
 	link->next = *head;
 	*head = link;
 }
@@ -103,6 +91,8 @@ xps_load_links_in_glyphs(fz_context *ctx, xps_document *doc, const fz_matrix *ct
 			bidi_level = atoi(bidi_level_att);
 
 		font = xps_lookup_font(ctx, doc, base_uri, font_uri_att, style_att);
+		if (!font)
+			return;
 		text = xps_parse_glyphs_imp(ctx, doc, &local_ctm, font, fz_atof(font_size_att),
 				fz_atof(origin_x_att), fz_atof(origin_y_att),
 				is_sideways, bidi_level, indices_att, unicode_att);
@@ -171,12 +161,14 @@ xps_load_links_in_element(fz_context *ctx, xps_document *doc, const fz_matrix *c
 static void
 xps_load_links_in_fixed_page(fz_context *ctx, xps_document *doc, const fz_matrix *ctm, xps_page *page, fz_link **link)
 {
-	fz_xml *node, *resource_tag;
+	fz_xml *root, *node, *resource_tag;
 	xps_resource *dict = NULL;
 	char base_uri[1024];
 	char *s;
 
-	if (!page->root)
+	root = fz_xml_root(page->xml);
+
+	if (!root)
 		return;
 
 	fz_strlcpy(base_uri, page->fix->name, sizeof base_uri);
@@ -184,11 +176,11 @@ xps_load_links_in_fixed_page(fz_context *ctx, xps_document *doc, const fz_matrix
 	if (s)
 		s[1] = 0;
 
-	resource_tag = fz_xml_down(fz_xml_find_down(page->root, "FixedPage.Resources"));
+	resource_tag = fz_xml_down(fz_xml_find_down(root, "FixedPage.Resources"));
 	if (resource_tag)
 		dict = xps_parse_resource_dictionary(ctx, doc, base_uri, resource_tag);
 
-	for (node = fz_xml_down(page->root); node; node = fz_xml_next(node))
+	for (node = fz_xml_down(root); node; node = fz_xml_next(node))
 		xps_load_links_in_element(ctx, doc, ctm, base_uri, dict, node, link);
 
 	if (dict)
@@ -196,8 +188,9 @@ xps_load_links_in_fixed_page(fz_context *ctx, xps_document *doc, const fz_matrix
 }
 
 fz_link *
-xps_load_links(fz_context *ctx, xps_page *page)
+xps_load_links(fz_context *ctx, fz_page *page_)
 {
+	xps_page *page = (xps_page*)page_;
 	fz_matrix ctm;
 	fz_link *link = NULL;
 	fz_scale(&ctm, 72.0f / 96.0f, 72.0f / 96.0f);

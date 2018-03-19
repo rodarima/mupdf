@@ -4,18 +4,22 @@
  * Simple test bed to work with merging pages from multiple PDFs into a single PDF.
  */
 
+#include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+
+#include <stdlib.h>
+#include <stdio.h>
 
 static void usage(void)
 {
 	fprintf(stderr,
 		"usage: mutool merge [-o output.pdf] [-O options] input.pdf [pages] [input2.pdf] [pages2] ...\n"
-		"\t-o\tname of PDF file to create\n"
-		"\t-O\tcomma separated list of output options\n"
+		"\t-o -\tname of PDF file to create\n"
+		"\t-O -\tcomma separated list of output options\n"
 		"\tinput.pdf\tname of input file from which to copy pages\n"
-		"\tpages\tcomma separated list of page numbers and ranges\n"
+		"\tpages\tcomma separated list of page numbers and ranges\n\n"
 		);
-	fprintf(stderr, "%s\n", fz_pdf_write_options_usage);
+	fputs(fz_pdf_write_options_usage, stderr);
 	exit(1);
 }
 
@@ -41,17 +45,18 @@ static void page_merge(int page_from, int page_to, pdf_graft_map *graft_map)
 	fz_try(ctx)
 	{
 		page_ref = pdf_lookup_page_obj(ctx, doc_src, page_from - 1);
+		pdf_flatten_inheritable_page_items(ctx, page_ref);
 
 		/* Make a new page object dictionary to hold the items we copy from the source page. */
 		page_dict = pdf_new_dict(ctx, doc_des, 4);
 
-		pdf_dict_put_drop(ctx, page_dict, PDF_NAME_Type, PDF_NAME_Page);
+		pdf_dict_put(ctx, page_dict, PDF_NAME_Type, PDF_NAME_Page);
 
 		for (i = 0; i < nelem(copy_list); i++)
 		{
 			obj = pdf_dict_get(ctx, page_ref, copy_list[i]);
 			if (obj != NULL)
-				pdf_dict_put_drop(ctx, page_dict, copy_list[i], pdf_graft_object(ctx, doc_des, doc_src, obj, graft_map));
+				pdf_dict_put_drop(ctx, page_dict, copy_list[i], pdf_graft_mapped_object(ctx, graft_map, obj));
 		}
 
 		/* Add the page object to the destination document. */
@@ -76,7 +81,7 @@ static void merge_range(const char *range)
 	pdf_graft_map *graft_map;
 
 	count = pdf_count_pages(ctx, doc_src);
-	graft_map = pdf_new_graft_map(ctx, doc_src);
+	graft_map = pdf_new_graft_map(ctx, doc_des);
 
 	fz_try(ctx)
 	{

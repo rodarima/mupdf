@@ -1,4 +1,8 @@
-#include "mupdf/xps.h"
+#include "mupdf/fitz.h"
+#include "xps-imp.h"
+
+#include <string.h>
+#include <stdio.h> /* for sscanf */
 
 static inline int unhex(int a)
 {
@@ -43,7 +47,7 @@ xps_parse_brush(fz_context *ctx, xps_document *doc, const fz_matrix *ctm, const 
 	else if (fz_xml_is_tag(node, "RadialGradientBrush"))
 		xps_parse_radial_gradient_brush(ctx, doc, ctm, area, base_uri, dict, node);
 	else
-		fz_warn(ctx, "unknown brush tag: %s", fz_xml_tag(node));
+		fz_warn(ctx, "unknown brush tag");
 }
 
 void
@@ -81,7 +85,7 @@ xps_begin_opacity(fz_context *ctx, xps_document *doc, const fz_matrix *ctm, cons
 	if (opacity_att)
 		opacity = fz_atof(opacity_att);
 
-	if (opacity_mask_tag && !strcmp(fz_xml_tag(opacity_mask_tag), "SolidColorBrush"))
+	if (fz_xml_is_tag(opacity_mask_tag, "SolidColorBrush"))
 	{
 		char *scb_opacity_att = fz_xml_att(opacity_mask_tag, "Opacity");
 		char *scb_color_att = fz_xml_att(opacity_mask_tag, "Color");
@@ -105,7 +109,7 @@ xps_begin_opacity(fz_context *ctx, xps_document *doc, const fz_matrix *ctm, cons
 
 	if (opacity_mask_tag)
 	{
-		fz_begin_mask(ctx, dev, area, 0, NULL, NULL);
+		fz_begin_mask(ctx, dev, area, 0, NULL, NULL, NULL);
 		xps_parse_brush(ctx, doc, ctm, area, base_uri, dict, opacity_mask_tag);
 		fz_end_mask(ctx, dev);
 	}
@@ -125,7 +129,7 @@ xps_end_opacity(fz_context *ctx, xps_document *doc, char *base_uri, xps_resource
 
 	if (opacity_mask_tag)
 	{
-		if (strcmp(fz_xml_tag(opacity_mask_tag), "SolidColorBrush"))
+		if (!fz_xml_is_tag(opacity_mask_tag, "SolidColorBrush"))
 			fz_pop_clip(ctx, dev);
 	}
 }
@@ -323,8 +327,9 @@ void
 xps_set_color(fz_context *ctx, xps_document *doc, fz_colorspace *colorspace, float *samples)
 {
 	int i;
+	int n = fz_colorspace_n(ctx, colorspace);
 	doc->colorspace = colorspace;
-	for (i = 0; i < colorspace->n; i++)
+	for (i = 0; i < n; i++)
 		doc->color[i] = samples[i + 1];
 	doc->alpha = samples[0] * doc->opacity[doc->opacity_top];
 }

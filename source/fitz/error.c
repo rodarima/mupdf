@@ -1,7 +1,21 @@
 #include "mupdf/fitz.h"
 
-#ifdef USE_OUTPUT_DEBUG_STRING
+#include <assert.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _MSC_VER
+#ifndef NDEBUG
+#define USE_OUTPUT_DEBUG_STRING
 #include <windows.h>
+#endif
+#endif
+
+#ifdef __ANDROID__
+#define USE_ANDROID_LOG
+#include <android/log.h>
 #endif
 
 /* Warning context */
@@ -16,7 +30,6 @@ void fz_flush_warnings(fz_context *ctx)
 	if (ctx->warn->count > 1)
 	{
 		fprintf(stderr, "warning: ... repeated %d times ...\n", ctx->warn->count);
-		LOGE("warning: ... repeated %d times ...\n", ctx->warn->count);
 	}
 	ctx->warn->message[0] = 0;
 	ctx->warn->count = 0;
@@ -26,10 +39,14 @@ void fz_vwarn(fz_context *ctx, const char *fmt, va_list ap)
 {
 	char buf[sizeof ctx->warn->message];
 
-	vsnprintf(buf, sizeof buf, fmt, ap);
+	fz_vsnprintf(buf, sizeof buf, fmt, ap);
+	buf[sizeof(buf) - 1] = 0;
 #ifdef USE_OUTPUT_DEBUG_STRING
 	OutputDebugStringA(buf);
 	OutputDebugStringA("\n");
+#endif
+#ifdef USE_ANDROID_LOG
+	__android_log_print(ANDROID_LOG_WARN, "libmupdf", "%s", buf);
 #endif
 
 	if (!strcmp(buf, ctx->warn->message))
@@ -40,7 +57,6 @@ void fz_vwarn(fz_context *ctx, const char *fmt, va_list ap)
 	{
 		fz_flush_warnings(ctx);
 		fprintf(stderr, "warning: %s\n", buf);
-		LOGE("warning: %s\n", buf);
 		fz_strlcpy(ctx->warn->message, buf, sizeof ctx->warn->message);
 		ctx->warn->count = 1;
 	}
@@ -53,7 +69,6 @@ void fz_warn(fz_context *ctx, const char *fmt, ...)
 	fz_vwarn(ctx, fmt, ap);
 	va_end(ap);
 }
-
 
 /* Error context */
 
@@ -95,12 +110,14 @@ FZ_NORETURN static void throw(fz_context *ctx)
 	}
 	else
 	{
-		fprintf(stderr, "uncaught exception: %s\n", ctx->error->message);
-		LOGE("uncaught exception: %s\n", ctx->error->message);
+		fprintf(stderr, "uncaught error: %s\n", ctx->error->message);
 #ifdef USE_OUTPUT_DEBUG_STRING
-		OutputDebugStringA("uncaught exception: ");
+		OutputDebugStringA("uncaught error: ");
 		OutputDebugStringA(ctx->error->message);
 		OutputDebugStringA("\n");
+#endif
+#ifdef USE_ANDROID_LOG
+		__android_log_print(ANDROID_LOG_ERROR, "libmupdf", "(uncaught) %s", ctx->error->message);
 #endif
 		exit(EXIT_FAILURE);
 	}
@@ -113,18 +130,21 @@ static int fz_fake_throw(fz_context *ctx, int code, const char *fmt, ...)
 	va_list args;
 	ctx->error->errcode = code;
 	va_start(args, fmt);
-	vsnprintf(ctx->error->message, sizeof ctx->error->message, fmt, args);
+	fz_vsnprintf(ctx->error->message, sizeof ctx->error->message, fmt, args);
+	ctx->error->message[sizeof(ctx->error->message) - 1] = 0;
 	va_end(args);
 
 	if (code != FZ_ERROR_ABORT)
 	{
 		fz_flush_warnings(ctx);
 		fprintf(stderr, "error: %s\n", ctx->error->message);
-		LOGE("error: %s\n", ctx->error->message);
 #ifdef USE_OUTPUT_DEBUG_STRING
 		OutputDebugStringA("error: ");
 		OutputDebugStringA(ctx->error->message);
 		OutputDebugStringA("\n");
+#endif
+#ifdef USE_ANDROID_LOG
+		__android_log_print(ANDROID_LOG_ERROR, "libmupdf", "%s", ctx->error->message);
 #endif
 	}
 
@@ -161,27 +181,30 @@ const char *fz_caught_message(fz_context *ctx)
 	return ctx->error->message;
 }
 
-void fz_vthrow(fz_context *ctx, int code, const char *fmt, va_list ap)
+FZ_NORETURN void fz_vthrow(fz_context *ctx, int code, const char *fmt, va_list ap)
 {
 	ctx->error->errcode = code;
-	vsnprintf(ctx->error->message, sizeof ctx->error->message, fmt, ap);
+	fz_vsnprintf(ctx->error->message, sizeof ctx->error->message, fmt, ap);
+	ctx->error->message[sizeof(ctx->error->message) - 1] = 0;
 
 	if (code != FZ_ERROR_ABORT)
 	{
 		fz_flush_warnings(ctx);
 		fprintf(stderr, "error: %s\n", ctx->error->message);
-		LOGE("error: %s\n", ctx->error->message);
 #ifdef USE_OUTPUT_DEBUG_STRING
 		OutputDebugStringA("error: ");
 		OutputDebugStringA(ctx->error->message);
 		OutputDebugStringA("\n");
+#endif
+#ifdef USE_ANDROID_LOG
+		__android_log_print(ANDROID_LOG_ERROR, "libmupdf", "%s", ctx->error->message);
 #endif
 	}
 
 	throw(ctx);
 }
 
-void fz_throw(fz_context *ctx, int code, const char *fmt, ...)
+FZ_NORETURN void fz_throw(fz_context *ctx, int code, const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -189,7 +212,7 @@ void fz_throw(fz_context *ctx, int code, const char *fmt, ...)
 	va_end(ap);
 }
 
-void fz_rethrow(fz_context *ctx)
+FZ_NORETURN void fz_rethrow(fz_context *ctx)
 {
 	assert(ctx && ctx->error && ctx->error->errcode >= FZ_ERROR_NONE);
 	throw(ctx);

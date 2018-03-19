@@ -24,7 +24,6 @@ static char *get_line(FILE *in)
 	return buffer;
 }
 
-
 int
 main(int argc, char **argv)
 {
@@ -59,7 +58,7 @@ main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	fprintf(out_c, "char *PDF_NAMES[] =\n{\n\t\"\",\n");
+	fprintf(out_c, "static const char *PDF_NAMES[] =\n{\n\t\"\",\n");
 
 	fprintf(out_h, "enum\n{\n\tPDF_OBJ_ENUM__DUMMY,\n");
 

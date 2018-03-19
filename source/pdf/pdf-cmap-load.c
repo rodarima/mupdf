@@ -1,6 +1,7 @@
+#include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
 
-unsigned int
+size_t
 pdf_cmap_size(fz_context *ctx, pdf_cmap *cmap)
 {
 	if (cmap == NULL)
@@ -29,15 +30,12 @@ pdf_load_embedded_cmap(fz_context *ctx, pdf_document *doc, pdf_obj *stmobj)
 	fz_var(cmap);
 	fz_var(usecmap);
 
-	if (pdf_obj_marked(ctx, stmobj))
-		fz_throw(ctx, FZ_ERROR_GENERIC, "Recursion in embedded cmap");
-
 	if ((cmap = pdf_find_item(ctx, pdf_drop_cmap_imp, stmobj)) != NULL)
 		return cmap;
 
 	fz_try(ctx)
 	{
-		file = pdf_open_stream(ctx, doc, pdf_to_num(ctx, stmobj), pdf_to_gen(ctx, stmobj));
+		file = pdf_open_stream(ctx, stmobj);
 		cmap = pdf_load_cmap(ctx, file);
 
 		obj = pdf_dict_get(ctx, stmobj, PDF_NAME_WMode);
@@ -52,7 +50,8 @@ pdf_load_embedded_cmap(fz_context *ctx, pdf_document *doc, pdf_obj *stmobj)
 		}
 		else if (pdf_is_indirect(ctx, obj))
 		{
-			pdf_mark_obj(ctx, obj);
+			if (pdf_mark_obj(ctx, obj))
+				fz_throw(ctx, FZ_ERROR_GENERIC, "recursive CMap");
 			fz_try(ctx)
 				usecmap = pdf_load_embedded_cmap(ctx, doc, obj);
 			fz_always(ctx)
@@ -88,7 +87,10 @@ pdf_new_identity_cmap(fz_context *ctx, int wmode, int bytes)
 	fz_try(ctx)
 	{
 		unsigned int high = (1 << (bytes * 8)) - 1;
-		sprintf(cmap->cmap_name, "Identity-%c", wmode ? 'V' : 'H');
+		if (wmode)
+			fz_strlcpy(cmap->cmap_name, "Identity-V", sizeof cmap->cmap_name);
+		else
+			fz_strlcpy(cmap->cmap_name, "Identity-H", sizeof cmap->cmap_name);
 		pdf_add_codespace(ctx, cmap, 0, high, bytes);
 		pdf_map_range_to_range(ctx, cmap, 0, high, 0);
 		pdf_sort_cmap(ctx, cmap);
@@ -106,7 +108,7 @@ pdf_new_identity_cmap(fz_context *ctx, int wmode, int bytes)
  * Load predefined CMap from system.
  */
 pdf_cmap *
-pdf_load_system_cmap(fz_context *ctx, char *cmap_name)
+pdf_load_system_cmap(fz_context *ctx, const char *cmap_name)
 {
 	pdf_cmap *usecmap;
 	pdf_cmap *cmap;

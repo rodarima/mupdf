@@ -1,4 +1,7 @@
+#include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+
+#include <string.h>
 
 enum
 {
@@ -272,6 +275,9 @@ pdf_new_crypt(fz_context *ctx, pdf_obj *dict, pdf_obj *id)
 void
 pdf_drop_crypt(fz_context *ctx, pdf_crypt *crypt)
 {
+	if (!crypt)
+		return;
+
 	pdf_drop_obj(ctx, crypt->id);
 	pdf_drop_obj(ctx, crypt->cf);
 	fz_free(ctx, crypt);
@@ -290,7 +296,7 @@ pdf_parse_crypt_filter(fz_context *ctx, pdf_crypt_filter *cf, pdf_crypt *crypt, 
 	int is_stdcf = (!is_identity && pdf_name_eq(ctx, name, PDF_NAME_StdCF));
 
 	if (!is_identity && !is_stdcf)
-		fz_throw(ctx, FZ_ERROR_GENERIC, "Crypt Filter not Identity or StdCF (%d %d R)", pdf_to_num(ctx, crypt->cf), pdf_to_gen(ctx, crypt->cf));
+		fz_throw(ctx, FZ_ERROR_GENERIC, "Crypt Filter not Identity or StdCF (%d 0 R)", pdf_to_num(ctx, crypt->cf));
 
 	cf->method = PDF_CRYPT_NONE;
 	cf->length = crypt->length;
@@ -324,7 +330,7 @@ pdf_parse_crypt_filter(fz_context *ctx, pdf_crypt_filter *cf, pdf_crypt *crypt, 
 			cf->length = pdf_to_int(ctx, obj);
 	}
 	else if (!is_identity)
-		fz_throw(ctx, FZ_ERROR_GENERIC, "cannot parse crypt filter (%d %d R)", pdf_to_num(ctx, crypt->cf), pdf_to_gen(ctx, crypt->cf));
+		fz_throw(ctx, FZ_ERROR_GENERIC, "cannot parse crypt filter (%d 0 R)", pdf_to_num(ctx, crypt->cf));
 
 	/* the length for crypt filters is supposed to be in bytes not bits */
 	if (cf->length < 40)
@@ -353,7 +359,7 @@ static const unsigned char padding[32] =
 };
 
 static void
-pdf_compute_encryption_key(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, int pwlen, unsigned char *key)
+pdf_compute_encryption_key(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, size_t pwlen, unsigned char *key)
 {
 	unsigned char buf[32];
 	unsigned int p;
@@ -422,7 +428,7 @@ pdf_compute_encryption_key(fz_context *ctx, pdf_crypt *crypt, unsigned char *pas
  */
 
 static void
-pdf_compute_encryption_key_r5(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, int pwlen, int ownerkey, unsigned char *validationkey)
+pdf_compute_encryption_key_r5(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, size_t pwlen, int ownerkey, unsigned char *validationkey)
 {
 	unsigned char buffer[128 + 8 + 48];
 	fz_sha256 sha256;
@@ -464,9 +470,9 @@ pdf_compute_encryption_key_r5(fz_context *ctx, pdf_crypt *crypt, unsigned char *
 
 	/* clear password buffer and use it as iv */
 	memset(buffer + 32, 0, sizeof(buffer) - 32);
-	if (aes_setkey_dec(&aes, buffer, crypt->length))
+	if (fz_aes_setkey_dec(&aes, buffer, crypt->length))
 		fz_throw(ctx, FZ_ERROR_GENERIC, "AES key init failed (keylen=%d)", crypt->length);
-	aes_crypt_cbc(&aes, AES_DECRYPT, 32, buffer + 32, ownerkey ? crypt->oe : crypt->ue, crypt->key);
+	fz_aes_crypt_cbc(&aes, FZ_AES_DECRYPT, 32, buffer + 32, ownerkey ? crypt->oe : crypt->ue, crypt->key);
 }
 
 /*
@@ -477,12 +483,12 @@ pdf_compute_encryption_key_r5(fz_context *ctx, pdf_crypt *crypt, unsigned char *
  */
 
 static void
-pdf_compute_hardened_hash_r6(fz_context *ctx, unsigned char *password, int pwlen, unsigned char salt[16], unsigned char *ownerkey, unsigned char hash[32])
+pdf_compute_hardened_hash_r6(fz_context *ctx, unsigned char *password, size_t pwlen, unsigned char salt[16], unsigned char *ownerkey, unsigned char hash[32])
 {
 	unsigned char data[(128 + 64 + 48) * 64];
 	unsigned char block[64];
 	int block_size = 32;
-	int data_len = 0;
+	size_t data_len = 0;
 	int i, j, sum;
 
 	fz_sha256 sha256;
@@ -510,9 +516,9 @@ pdf_compute_hardened_hash_r6(fz_context *ctx, unsigned char *password, int pwlen
 			memcpy(data + j * data_len, data, data_len);
 
 		/* Step 3: encrypt data using data block as key and iv */
-		if (aes_setkey_enc(&aes, block, 128))
+		if (fz_aes_setkey_enc(&aes, block, 128))
 			fz_throw(ctx, FZ_ERROR_GENERIC, "AES key init failed (keylen=%d)", 128);
-		aes_crypt_cbc(&aes, AES_ENCRYPT, data_len * 64, block + 16, data, data);
+		fz_aes_crypt_cbc(&aes, FZ_AES_ENCRYPT, data_len * 64, block + 16, data, data);
 
 		/* Step 4: determine SHA-2 hash size for this round */
 		for (j = 0, sum = 0; j < 16; j++)
@@ -545,7 +551,7 @@ pdf_compute_hardened_hash_r6(fz_context *ctx, unsigned char *password, int pwlen
 }
 
 static void
-pdf_compute_encryption_key_r6(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, int pwlen, int ownerkey, unsigned char *validationkey)
+pdf_compute_encryption_key_r6(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, size_t pwlen, int ownerkey, unsigned char *validationkey)
 {
 	unsigned char hash[32];
 	unsigned char iv[16];
@@ -563,10 +569,9 @@ pdf_compute_encryption_key_r6(fz_context *ctx, pdf_crypt *crypt, unsigned char *
 		hash);
 
 	memset(iv, 0, sizeof(iv));
-	if (aes_setkey_dec(&aes, hash, 256))
+	if (fz_aes_setkey_dec(&aes, hash, 256))
 		fz_throw(ctx, FZ_ERROR_GENERIC, "AES key init failed (keylen=256)");
-	aes_crypt_cbc(&aes, AES_DECRYPT, 32, iv,
-		ownerkey ? crypt->oe : crypt->ue, crypt->key);
+	fz_aes_crypt_cbc(&aes, FZ_AES_DECRYPT, 32, iv, ownerkey ? crypt->oe : crypt->ue, crypt->key);
 }
 
 /*
@@ -575,7 +580,7 @@ pdf_compute_encryption_key_r6(fz_context *ctx, pdf_crypt *crypt, unsigned char *
  */
 
 static void
-pdf_compute_user_password(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, int pwlen, unsigned char *output)
+pdf_compute_user_password(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, size_t pwlen, unsigned char *output)
 {
 	if (crypt->r == 2)
 	{
@@ -636,7 +641,7 @@ pdf_compute_user_password(fz_context *ctx, pdf_crypt *crypt, unsigned char *pass
  */
 
 static int
-pdf_authenticate_user_password(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, int pwlen)
+pdf_authenticate_user_password(fz_context *ctx, pdf_crypt *crypt, unsigned char *password, size_t pwlen)
 {
 	unsigned char output[32];
 	pdf_compute_user_password(ctx, crypt, password, pwlen, output);
@@ -655,7 +660,7 @@ pdf_authenticate_user_password(fz_context *ctx, pdf_crypt *crypt, unsigned char 
  */
 
 static int
-pdf_authenticate_owner_password(fz_context *ctx, pdf_crypt *crypt, unsigned char *ownerpass, int pwlen)
+pdf_authenticate_owner_password(fz_context *ctx, pdf_crypt *crypt, unsigned char *ownerpass, size_t pwlen)
 {
 	unsigned char pwbuf[32];
 	unsigned char key[32];
@@ -756,25 +761,40 @@ int
 pdf_authenticate_password(fz_context *ctx, pdf_document *doc, const char *pwd_utf8)
 {
 	char password[2048];
+	int auth;
 
-	if (doc->crypt)
+	if (!doc->crypt)
+		return 1; /* No password required */
+
+	password[0] = 0;
+	if (pwd_utf8)
 	{
-		password[0] = 0;
-		if (pwd_utf8)
-		{
-			if (doc->crypt->r <= 4)
-				pdf_docenc_from_utf8(password, pwd_utf8, sizeof password);
-			else
-				pdf_saslprep_from_utf8(password, pwd_utf8, sizeof password);
-		}
-
-		if (pdf_authenticate_user_password(ctx, doc->crypt, (unsigned char *)password, strlen(password)))
-			return 1;
-		if (pdf_authenticate_owner_password(ctx, doc->crypt, (unsigned char *)password, strlen(password)))
-			return 1;
-		return 0;
+		if (doc->crypt->r <= 4)
+			pdf_docenc_from_utf8(password, pwd_utf8, sizeof password);
+		else
+			pdf_saslprep_from_utf8(password, pwd_utf8, sizeof password);
 	}
-	return 1;
+
+	auth = 0;
+	if (pdf_authenticate_user_password(ctx, doc->crypt, (unsigned char *)password, strlen(password)))
+		auth = 2;
+	if (pdf_authenticate_owner_password(ctx, doc->crypt, (unsigned char *)password, strlen(password)))
+		auth |= 4;
+	else if (auth & 2)
+	{
+		/* We need to reauthenticate the user password,
+		 * because the failed attempt to authenticate
+		 * the owner password will have invalidated the
+		 * stored keys. */
+		(void)pdf_authenticate_user_password(ctx, doc->crypt, (unsigned char *)password, strlen(password));
+	}
+
+	/* To match Acrobat, we choose not to allow an empty owner
+	 * password, unless the user password is also the empty one. */
+	if (*password == 0 && auth == 4)
+		return 0;
+
+	return auth;
 }
 
 int
@@ -936,9 +956,9 @@ pdf_crypt_obj_imp(fz_context *ctx, pdf_crypt *crypt, pdf_obj *obj, unsigned char
 				unsigned char iv[16];
 				fz_aes aes;
 				memcpy(iv, s, 16);
-				if (aes_setkey_dec(&aes, key, keylen * 8))
+				if (fz_aes_setkey_dec(&aes, key, keylen * 8))
 					fz_throw(ctx, FZ_ERROR_GENERIC, "AES key init failed (keylen=%d)", keylen * 8);
-				aes_crypt_cbc(&aes, AES_DECRYPT, n - 16, iv, s + 16, s);
+				fz_aes_crypt_cbc(&aes, FZ_AES_DECRYPT, n - 16, iv, s + 16, s);
 				/* delete space used for iv and padding bytes at end */
 				if (s[n - 17] < 1 || s[n - 17] > 16)
 					fz_warn(ctx, "aes padding out of range");
@@ -997,7 +1017,7 @@ pdf_open_crypt_imp(fz_context *ctx, fz_stream *chain, pdf_crypt *crypt, pdf_cryp
 	if (stmf->method == PDF_CRYPT_AESV2 || stmf->method == PDF_CRYPT_AESV3)
 		return fz_open_aesd(ctx, chain, key, len);
 
-	return fz_open_copy(ctx, chain);
+	return chain;
 }
 
 fz_stream *
@@ -1009,12 +1029,26 @@ pdf_open_crypt(fz_context *ctx, fz_stream *chain, pdf_crypt *crypt, int num, int
 fz_stream *
 pdf_open_crypt_with_filter(fz_context *ctx, fz_stream *chain, pdf_crypt *crypt, pdf_obj *name, int num, int gen)
 {
-	if (!pdf_name_eq(ctx, name, PDF_NAME_Identity))
+	fz_var(chain);
+
+	fz_try(ctx)
 	{
-		pdf_crypt_filter cf;
-		pdf_parse_crypt_filter(ctx, &cf, crypt, name);
-		return pdf_open_crypt_imp(ctx, chain, crypt, &cf, num, gen);
+		if (!pdf_name_eq(ctx, name, PDF_NAME_Identity))
+		{
+			pdf_crypt_filter cf;
+			fz_stream *tmp;
+			pdf_parse_crypt_filter(ctx, &cf, crypt, name);
+			tmp = chain;
+			chain = NULL;
+			chain = pdf_open_crypt_imp(ctx, tmp, crypt, &cf, num, gen);
+		}
 	}
+	fz_catch(ctx)
+	{
+		fz_drop_stream(ctx, chain);
+		fz_rethrow(ctx);
+	}
+
 	return chain;
 }
 
@@ -1023,22 +1057,109 @@ pdf_print_crypt(fz_context *ctx, fz_output *out, pdf_crypt *crypt)
 {
 	int i;
 
-	fz_printf(ctx, out, "crypt {\n");
+	fz_write_printf(ctx, out, "crypt {\n");
 
-	fz_printf(ctx, out, "\tv=%d length=%d\n", crypt->v, crypt->length);
-	fz_printf(ctx, out, "\tstmf method=%d length=%d\n", crypt->stmf.method, crypt->stmf.length);
-	fz_printf(ctx, out, "\tstrf method=%d length=%d\n", crypt->strf.method, crypt->strf.length);
-	fz_printf(ctx, out, "\tr=%d\n", crypt->r);
+	fz_write_printf(ctx, out, "\tv=%d length=%d\n", crypt->v, crypt->length);
+	fz_write_printf(ctx, out, "\tstmf method=%d length=%d\n", crypt->stmf.method, crypt->stmf.length);
+	fz_write_printf(ctx, out, "\tstrf method=%d length=%d\n", crypt->strf.method, crypt->strf.length);
+	fz_write_printf(ctx, out, "\tr=%d\n", crypt->r);
 
-	fz_printf(ctx, out, "\to=<");
+	fz_write_printf(ctx, out, "\to=<");
 	for (i = 0; i < 32; i++)
-		fz_printf(ctx, out, "%02X", crypt->o[i]);
-	fz_printf(ctx, out, ">\n");
+		fz_write_printf(ctx, out, "%02X", crypt->o[i]);
+	fz_write_printf(ctx, out, ">\n");
 
-	fz_printf(ctx, out, "\tu=<");
+	fz_write_printf(ctx, out, "\tu=<");
 	for (i = 0; i < 32; i++)
-		fz_printf(ctx, out, "%02X", crypt->u[i]);
-	fz_printf(ctx, out, ">\n");
+		fz_write_printf(ctx, out, "%02X", crypt->u[i]);
+	fz_write_printf(ctx, out, ">\n");
 
-	fz_printf(ctx, out, "}\n");
+	fz_write_printf(ctx, out, "}\n");
+}
+
+void pdf_encrypt_data(fz_context *ctx, pdf_crypt *crypt, int num, int gen, void (*write_data)(fz_context *ctx, void *, const unsigned char *, int), void *arg, const unsigned char *s, int n)
+{
+	unsigned char buffer[256];
+	unsigned char key[32];
+	int keylen;
+
+	if (crypt == NULL)
+	{
+		write_data(ctx, arg, s, n);
+		return;
+	}
+
+	keylen = pdf_compute_object_key(crypt, &crypt->strf, num, gen, key, 32);
+
+	if (crypt->strf.method == PDF_CRYPT_RC4)
+	{
+		fz_arc4 arc4;
+		fz_arc4_init(&arc4, key, keylen);
+		while (n > 0)
+		{
+			int len = n;
+			if (len > sizeof(buffer))
+				len = sizeof(buffer);
+			fz_arc4_encrypt(&arc4, buffer, s, len);
+			write_data(ctx, arg, buffer, len);
+			s += len;
+			n -= len;
+		}
+		return;
+	}
+
+	if (crypt->strf.method == PDF_CRYPT_AESV2 || crypt->strf.method == PDF_CRYPT_AESV3)
+	{
+		fz_aes aes;
+		unsigned char iv[16];
+
+		/* Empty strings can be represented by empty strings */
+		if (n == 0)
+			return;
+
+		if (fz_aes_setkey_enc(&aes, key, keylen * 8))
+			fz_throw(ctx, FZ_ERROR_GENERIC, "AES key init failed (keylen=%d)", keylen * 8);
+
+		fz_memrnd(ctx, iv, 16);
+		write_data(ctx, arg, iv, 16);
+
+		while (n > 0)
+		{
+			int len = n;
+			if (len > 16)
+				len = 16;
+			memcpy(buffer, s, len);
+			if (len != 16)
+				memset(&buffer[len], 16-len, 16-len);
+			fz_aes_crypt_cbc(&aes, FZ_AES_ENCRYPT, 16, iv, buffer, buffer+16);
+			write_data(ctx, arg, buffer+16, 16);
+			s += 16;
+			n -= 16;
+		}
+		if (n == 0) {
+			memset(buffer, 16, 16);
+			fz_aes_crypt_cbc(&aes, FZ_AES_ENCRYPT, 16, iv, buffer, buffer+16);
+			write_data(ctx, arg, buffer+16, 16);
+		}
+		return;
+	}
+
+	/* Should never happen, but... */
+	write_data(ctx, arg, s, n);
+}
+
+int pdf_encrypted_len(fz_context *ctx, pdf_crypt *crypt, int num, int gen, int len)
+{
+	if (crypt == NULL)
+		return len;
+
+	if (crypt->strf.method == PDF_CRYPT_AESV2 || crypt->strf.method == PDF_CRYPT_AESV3)
+	{
+		len += 16; /* 16 for IV */
+		if ((len & 15) == 0)
+			len += 16; /* Another 16 if our last block is full anyway */
+		len = (len + 15) & ~15; /* And pad to the block */
+	}
+
+	return len;
 }

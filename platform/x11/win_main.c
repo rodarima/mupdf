@@ -12,8 +12,16 @@
 /* Include pdfapp.h *AFTER* the UNICODE defines */
 #include "pdfapp.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+
 #ifndef WM_MOUSEWHEEL
 #define WM_MOUSEWHEEL 0x020A
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
 #endif
 
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
@@ -31,14 +39,11 @@ static HCURSOR arrowcurs, handcurs, waitcurs, caretcurs;
 static LRESULT CALLBACK frameproc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK viewproc(HWND, UINT, WPARAM, LPARAM);
 static int timer_pending = 0;
+static char *password = NULL;
 
 static int justcopied = 0;
 
 static pdfapp_t gapp;
-
-#ifndef PATH_MAX
-#define PATH_MAX (1024)
-#endif
 
 static wchar_t wbuf[PATH_MAX];
 static char filename[PATH_MAX];
@@ -51,14 +56,14 @@ static char filename[PATH_MAX];
 	RegCreateKeyExA(parent, name, 0, 0, 0, KEY_WRITE, 0, &ptr, 0)
 
 #define SET_KEY(parent, name, value) \
-	RegSetValueExA(parent, name, 0, REG_SZ, (const BYTE *)(value), strlen(value) + 1)
+	RegSetValueExA(parent, name, 0, REG_SZ, (const BYTE *)(value), (DWORD)strlen(value) + 1)
 
 void install_app(char *argv0)
 {
 	char buf[512];
-	HKEY software, classes, mupdf, dotpdf, dotxps, dotepub;
+	HKEY software, classes, mupdf, dotpdf, dotxps, dotepub, dotfb2;
 	HKEY shell, open, command, supported_types;
-	HKEY pdf_progids, xps_progids, epub_progids;
+	HKEY pdf_progids, xps_progids, epub_progids, fb2_progids;
 
 	OPEN_KEY(HKEY_CURRENT_USER, "Software", software);
 	OPEN_KEY(software, "Classes", classes);
@@ -68,6 +73,8 @@ void install_app(char *argv0)
 	OPEN_KEY(dotxps, "OpenWithProgids", xps_progids);
 	OPEN_KEY(classes, ".epub", dotepub);
 	OPEN_KEY(dotepub, "OpenWithProgids", epub_progids);
+	OPEN_KEY(classes, ".fb2", dotfb2);
+	OPEN_KEY(dotfb2, "OpenWithProgids", fb2_progids);
 	OPEN_KEY(classes, "MuPDF", mupdf);
 	OPEN_KEY(mupdf, "SupportedTypes", supported_types);
 	OPEN_KEY(mupdf, "shell", shell);
@@ -84,7 +91,9 @@ void install_app(char *argv0)
 	SET_KEY(pdf_progids, "MuPDF", "");
 	SET_KEY(xps_progids, "MuPDF", "");
 	SET_KEY(epub_progids, "MuPDF", "");
+	SET_KEY(fb2_progids, "MuPDF", "");
 
+	RegCloseKey(dotfb2);
 	RegCloseKey(dotepub);
 	RegCloseKey(dotxps);
 	RegCloseKey(dotpdf);
@@ -190,7 +199,7 @@ int winfilename(wchar_t *buf, int len)
 	ofn.nMaxFile = len;
 	ofn.lpstrInitialDir = NULL;
 	ofn.lpstrTitle = L"MuPDF: Open PDF file";
-	ofn.lpstrFilter = L"Documents (*.pdf;*.xps;*.cbz;*.epub;*.zip;*.png;*.jpeg;*.tiff)\0*.zip;*.cbz;*.xps;*.epub;*.pdf;*.jpe;*.jpg;*.jpeg;*.jfif;*.tif;*.tiff\0PDF Files (*.pdf)\0*.pdf\0XPS Files (*.xps)\0*.xps\0CBZ Files (*.cbz;*.zip)\0*.zip;*.cbz\0EPUB Files (*.epub)\0*.epub\0Image Files (*.png;*.jpeg;*.tiff)\0*.png;*.jpg;*.jpe;*.jpeg;*.jfif;*.tif;*.tiff\0All Files\0*\0\0";
+	ofn.lpstrFilter = L"Documents (*.pdf;*.xps;*.cbz;*.epub;*.fb2;*.zip;*.png;*.jpeg;*.tiff)\0*.zip;*.cbz;*.xps;*.epub;*.fb2;*.pdf;*.jpe;*.jpg;*.jpeg;*.jfif;*.tif;*.tiff\0PDF Files (*.pdf)\0*.pdf\0XPS Files (*.xps)\0*.xps\0CBZ Files (*.cbz;*.zip)\0*.zip;*.cbz\0EPUB Files (*.epub)\0*.epub\0FictionBook 2 Files (*.fb2)\0*.fb2\0Image Files (*.png;*.jpeg;*.tiff)\0*.png;*.jpg;*.jpe;*.jpeg;*.jfif;*.tif;*.tiff\0All Files\0*\0\0";
 	ofn.Flags = OFN_FILEMUSTEXIST|OFN_HIDEREADONLY;
 	return GetOpenFileNameW(&ofn);
 }
@@ -289,7 +298,7 @@ static char **cd_opts;
 static char **cd_vals;
 static int pd_okay = 0;
 
-INT CALLBACK
+INT_PTR CALLBACK
 dlogpassproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	switch(message)
@@ -316,7 +325,7 @@ dlogpassproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return FALSE;
 }
 
-INT CALLBACK
+INT_PTR CALLBACK
 dlogtextproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	switch(message)
@@ -353,7 +362,7 @@ dlogtextproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return FALSE;
 }
 
-INT CALLBACK
+INT_PTR CALLBACK
 dlogchoiceproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	HWND listbox;
@@ -405,6 +414,14 @@ char *winpassword(pdfapp_t *app, char *filename)
 {
 	char buf[1024], *s;
 	int code;
+
+	if (password)
+	{
+		char *p = password;
+		password = NULL;
+		return p;
+	}
+
 	strcpy(buf, filename);
 	s = buf;
 	if (strrchr(s, '\\')) s = strrchr(s, '\\') + 1;
@@ -446,7 +463,7 @@ int winchoiceinput(pdfapp_t *app, int nopts, char *opts[], int *nvals, char *val
 	return pd_okay;
 }
 
-INT CALLBACK
+INT_PTR CALLBACK
 dloginfoproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	char buf[256];
@@ -527,7 +544,7 @@ void info()
 		winerror(&gapp, "cannot create info dialog");
 }
 
-INT CALLBACK
+INT_PTR CALLBACK
 dlogaboutproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	switch(message)
@@ -718,7 +735,7 @@ void windrawstring(pdfapp_t *app, int x, int y, char *s)
 {
 	HFONT font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
 	SelectObject(hdc, font);
-	TextOutA(hdc, x, y - 12, s, strlen(s));
+	TextOutA(hdc, x, y - 12, s, (int)strlen(s));
 }
 
 void winblitsearch()
@@ -1107,7 +1124,7 @@ viewproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 	/* Mouse wheel */
 
 	case WM_MOUSEWHEEL:
-		if ((signed short)HIWORD(wParam) > 0)
+		if ((signed short)HIWORD(wParam) <= 0)
 		{
 			handlemouse(oldx, oldy, 4, 1);
 			handlemouse(oldx, oldy, 4, -1);
@@ -1163,7 +1180,6 @@ viewproc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_APP:
 		pdfapp_reloadpage(&gapp);
 		break;
-
 	}
 
 	fflush(stdout);
@@ -1191,7 +1207,7 @@ get_system_dpi(void)
 	hdpi = GetDeviceCaps(desktopDC, LOGPIXELSX);
 	vdpi = GetDeviceCaps(desktopDC, LOGPIXELSY);
 	/* hdpi,vdpi = 100 means 96dpi. */
-	return ((hdpi + vdpi) * 96.0 + 0.5) / 200;
+	return ((hdpi + vdpi) * 96 + 0.5f) / 200;
 }
 
 static void usage(void)
@@ -1203,8 +1219,10 @@ static void usage(void)
 	fprintf(stderr, "\t-C -\tRRGGBB (tint color in hexadecimal syntax)\n");
 	fprintf(stderr, "\t-W -\tpage width for EPUB layout\n");
 	fprintf(stderr, "\t-H -\tpage height for EPUB layout\n");
+	fprintf(stderr, "\t-I -\tinvert colors\n");
 	fprintf(stderr, "\t-S -\tfont size for EPUB layout\n");
 	fprintf(stderr, "\t-U -\tuser style sheet for EPUB layout\n");
+	fprintf(stderr, "\t-X\tdisable document styles for EPUB layout\n");
 	exit(1);
 }
 
@@ -1221,8 +1239,6 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShow
 	int bps = 0;
 	int displayRes = get_system_dpi();
 	int c;
-	char *password = NULL;
-	char *layout_css = NULL;
 
 	ctx = fz_new_context(NULL, NULL, FZ_STORE_DEFAULT);
 	if (!ctx)
@@ -1234,7 +1250,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShow
 
 	argv = fz_argv_from_wargv(argc, wargv);
 
-	while ((c = fz_getopt(argc, argv, "p:r:A:C:W:H:S:U:b:")) != -1)
+	while ((c = fz_getopt(argc, argv, "Ip:r:A:C:W:H:S:U:Xb:")) != -1)
 	{
 		switch (c)
 		{
@@ -1247,12 +1263,14 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShow
 			break;
 		case 'p': password = fz_optarg; break;
 		case 'r': displayRes = fz_atoi(fz_optarg); break;
+		case 'I': gapp.invert = 1; break;
 		case 'A': fz_set_aa_level(ctx, fz_atoi(fz_optarg)); break;
 		case 'W': gapp.layout_w = fz_atoi(fz_optarg); break;
 		case 'H': gapp.layout_h = fz_atoi(fz_optarg); break;
 		case 'S': gapp.layout_em = fz_atoi(fz_optarg); break;
 		case 'b': bps = (fz_optarg && *fz_optarg) ? fz_atoi(fz_optarg) : 4096; break;
-		case 'U': layout_css = fz_optarg; break;
+		case 'U': gapp.layout_css = fz_optarg; break;
+		case 'X': gapp.layout_use_doc_css = 0; break;
 		default: usage();
 		}
 	}
@@ -1266,7 +1284,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShow
 
 	if (fz_optind < argc)
 	{
-		strcpy(filename, argv[fz_optind]);
+		strcpy(filename, argv[fz_optind++]);
 	}
 	else
 	{
@@ -1277,13 +1295,8 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShow
 			winerror(&gapp, "cannot convert filename to utf-8");
 	}
 
-	if (layout_css)
-	{
-		fz_buffer *buf = fz_read_file(ctx, layout_css);
-		fz_write_buffer_byte(ctx, buf, 0);
-		fz_set_user_css(ctx, (char*)buf->data);
-		fz_drop_buffer(ctx, buf);
-	}
+	if (fz_optind < argc)
+		gapp.pageno = atoi(argv[fz_optind++]);
 
 	if (bps)
 		pdfapp_open_progressive(&gapp, filename, 0, bps);

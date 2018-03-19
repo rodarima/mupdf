@@ -1,5 +1,9 @@
 #include "mupdf/fitz.h"
 
+#include <math.h>
+#include <float.h>
+#include <limits.h>
+
 #define MAX4(a,b,c,d) fz_max(fz_max(a,b), fz_max(c,d))
 #define MIN4(a,b,c,d) fz_min(fz_min(a,b), fz_min(c,d))
 
@@ -124,8 +128,8 @@ fz_rotate(fz_matrix *m, float theta)
 	}
 	else
 	{
-		s = sinf(theta * (float)M_PI / 180);
-		c = cosf(theta * (float)M_PI / 180);
+		s = sinf(theta * FZ_PI / 180);
+		c = cosf(theta * FZ_PI / 180);
 	}
 
 	m->a = c; m->b = s;
@@ -173,8 +177,8 @@ fz_pre_rotate(fz_matrix *m, float theta)
 	}
 	else
 	{
-		float s = sinf(theta * (float)M_PI / 180);
-		float c = cosf(theta * (float)M_PI / 180);
+		float s = sinf(theta * FZ_PI / 180);
+		float c = cosf(theta * FZ_PI / 180);
 		float a = m->a;
 		float b = m->b;
 		m->a = c * a + s * m->c;
@@ -228,7 +232,6 @@ fz_invert_matrix(fz_matrix *dst, const fz_matrix *src)
 int
 fz_try_invert_matrix(fz_matrix *dst, const fz_matrix *src)
 {
-	/* Be careful to cope with dst == src */
 	double sa = (double)src->a;
 	double sb = (double)src->b;
 	double sc = (double)src->c;
@@ -368,13 +371,13 @@ fz_round_rect(fz_irect * restrict b, const fz_rect *restrict r)
 {
 	int i;
 
-	i = floorf(r->x0 + 0.001);
+	i = floorf(r->x0 + 0.001f);
 	b->x0 = fz_clamp(i, MIN_SAFE_INT, MAX_SAFE_INT);
-	i = floorf(r->y0 + 0.001);
+	i = floorf(r->y0 + 0.001f);
 	b->y0 = fz_clamp(i, MIN_SAFE_INT, MAX_SAFE_INT);
-	i = ceilf(r->x1 - 0.001);
+	i = ceilf(r->x1 - 0.001f);
 	b->x1 = fz_clamp(i, MIN_SAFE_INT, MAX_SAFE_INT);
-	i = ceilf(r->y1 - 0.001);
+	i = ceilf(r->y1 - 0.001f);
 	b->y1 = fz_clamp(i, MIN_SAFE_INT, MAX_SAFE_INT);
 
 	return b;
@@ -537,4 +540,18 @@ fz_rect *fz_include_point_in_rect(fz_rect *r, const fz_point *p)
 	if (p->y > r->y1) r->y1 = p->y;
 
 	return r;
+}
+
+int fz_contains_rect(const fz_rect *a, const fz_rect *b)
+{
+	if (a == NULL || b == NULL)
+		return 0;
+	if (fz_is_empty_rect(b))
+		return 1;
+	if (fz_is_empty_rect(a))
+		return 0;
+	return ((a->x0 <= b->x0) &&
+		(a->y0 <= b->y0) &&
+		(a->x1 >= b->x1) &&
+		(a->y1 >= b->y1));
 }

@@ -1,27 +1,31 @@
+#include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+
+#include <string.h>
 
 /*
  * Check if an object is a stream or not.
  */
 int
-pdf_obj_num_is_stream(fz_context *ctx, pdf_document *doc, int num, int gen)
+pdf_obj_num_is_stream(fz_context *ctx, pdf_document *doc, int num)
 {
 	pdf_xref_entry *entry;
 
 	if (num <= 0 || num >= pdf_xref_len(ctx, doc))
 		return 0;
 
-	entry = pdf_cache_object(ctx, doc, num, gen);
+	entry = pdf_cache_object(ctx, doc, num);
 
 	return entry->stm_ofs != 0 || entry->stm_buf;
 }
 
 int
-pdf_is_stream(fz_context *ctx, pdf_obj *obj)
+pdf_is_stream(fz_context *ctx, pdf_obj *ref)
 {
-	pdf_document *doc = pdf_get_bound_document(ctx, obj);
-	int num = pdf_obj_parent_num(ctx, obj);
-	return pdf_obj_num_is_stream(ctx, doc, num, 0);
+	pdf_document *doc = pdf_get_indirect_document(ctx, ref);
+	if (doc)
+		return pdf_obj_num_is_stream(ctx, doc, pdf_to_num(ctx, ref));
+	return 0;
 }
 
 /*
@@ -68,9 +72,9 @@ pdf_load_jbig2_globals(fz_context *ctx, pdf_document *doc, pdf_obj *dict)
 
 	fz_try(ctx)
 	{
-		buf = pdf_load_stream(ctx, doc, pdf_to_num(ctx, dict), pdf_to_gen(ctx, dict));
-		globals = fz_load_jbig2_globals(ctx, buf->data, buf->len);
-		pdf_store_item(ctx, dict, globals, buf->len);
+		buf = pdf_load_stream(ctx, dict);
+		globals = fz_load_jbig2_globals(ctx, buf);
+		pdf_store_item(ctx, dict, globals, fz_buffer_storage(ctx, buf, NULL));
 	}
 	fz_always(ctx)
 	{
@@ -152,58 +156,82 @@ static fz_stream *
 build_filter(fz_context *ctx, fz_stream *chain, pdf_document *doc, pdf_obj *f, pdf_obj *p, int num, int gen, fz_compression_params *params)
 {
 	fz_compression_params local_params;
+	fz_stream *tmp;
 
-	if (params == NULL)
-		params = &local_params;
+	fz_var(chain);
 
-	build_compression_params(ctx, f, p, params);
-
-	/* If we were using params we were passed in, and we successfully
-	 * recognised the image type, we can use the existing filter and
-	 * shortstop here. */
-	if (params != &local_params && params->type != FZ_IMAGE_RAW)
-		return chain;
-
-	if (params->type != FZ_IMAGE_RAW)
-		return fz_open_image_decomp_stream(ctx, chain, params, NULL);
-
-	if (pdf_name_eq(ctx, f, PDF_NAME_ASCIIHexDecode) || pdf_name_eq(ctx, f, PDF_NAME_AHx))
-		return fz_open_ahxd(ctx, chain);
-
-	else if (pdf_name_eq(ctx, f, PDF_NAME_ASCII85Decode) || pdf_name_eq(ctx, f, PDF_NAME_A85))
-		return fz_open_a85d(ctx, chain);
-
-	else if (pdf_name_eq(ctx, f, PDF_NAME_JBIG2Decode))
+	fz_try(ctx)
 	{
-		fz_jbig2_globals *globals = NULL;
-		pdf_obj *obj = pdf_dict_get(ctx, p, PDF_NAME_JBIG2Globals);
-		if (pdf_is_indirect(ctx, obj))
-			globals = pdf_load_jbig2_globals(ctx, doc, obj);
-		/* fz_open_jbig2d takes possession of globals */
-		return fz_open_jbig2d(ctx, chain, globals);
-	}
+		if (params == NULL)
+			params = &local_params;
 
-	else if (pdf_name_eq(ctx, f, PDF_NAME_JPXDecode))
-		return chain; /* JPX decoding is special cased in the image loading code */
+		build_compression_params(ctx, f, p, params);
 
-	else if (pdf_name_eq(ctx, f, PDF_NAME_Crypt))
-	{
-		pdf_obj *name;
+		/* If we were using params we were passed in, and we successfully
+		 * recognised the image type, we can use the existing filter and
+		 * shortstop here. */
+		if (params != &local_params && params->type != FZ_IMAGE_RAW)
+			break; /* nothing to do */
 
-		if (!doc->crypt)
+		else if (params->type != FZ_IMAGE_RAW)
 		{
-			fz_warn(ctx, "crypt filter in unencrypted document");
-			return chain;
+			tmp = chain;
+			chain = NULL;
+			chain = fz_open_image_decomp_stream(ctx, tmp, params, NULL);
 		}
 
-		name = pdf_dict_get(ctx, p, PDF_NAME_Name);
-		if (pdf_is_name(ctx, name))
-			return pdf_open_crypt_with_filter(ctx, chain, doc->crypt, name, num, gen);
+		else if (pdf_name_eq(ctx, f, PDF_NAME_ASCIIHexDecode) || pdf_name_eq(ctx, f, PDF_NAME_AHx))
+		{
+			tmp = chain;
+			chain = NULL;
+			chain = fz_open_ahxd(ctx, tmp);
+		}
 
-		return chain;
+		else if (pdf_name_eq(ctx, f, PDF_NAME_ASCII85Decode) || pdf_name_eq(ctx, f, PDF_NAME_A85))
+		{
+			tmp = chain;
+			chain = NULL;
+			chain = fz_open_a85d(ctx, tmp);
+		}
+
+		else if (pdf_name_eq(ctx, f, PDF_NAME_JBIG2Decode))
+		{
+			fz_jbig2_globals *globals = NULL;
+			pdf_obj *obj = pdf_dict_get(ctx, p, PDF_NAME_JBIG2Globals);
+			if (pdf_is_indirect(ctx, obj))
+				globals = pdf_load_jbig2_globals(ctx, doc, obj);
+			tmp = chain;
+			chain = NULL;
+			chain = fz_open_jbig2d(ctx, tmp, globals);
+		}
+
+		else if (pdf_name_eq(ctx, f, PDF_NAME_JPXDecode))
+			break; /* JPX decoding is special cased in the image loading code */
+
+		else if (pdf_name_eq(ctx, f, PDF_NAME_Crypt))
+		{
+			if (!doc->crypt)
+				fz_warn(ctx, "crypt filter in unencrypted document");
+			else
+			{
+				pdf_obj *name = pdf_dict_get(ctx, p, PDF_NAME_Name);
+				if (pdf_is_name(ctx, name))
+				{
+					tmp = chain;
+					chain = NULL;
+					chain = pdf_open_crypt_with_filter(ctx, tmp, doc->crypt, name, num, gen);
+				}
+			}
+		}
+		else
+			fz_warn(ctx, "unknown filter name (%s)", pdf_to_name(ctx, f));
+	}
+	fz_catch(ctx)
+	{
+		fz_drop_stream(ctx, chain);
+		fz_rethrow(ctx);
 	}
 
-	fz_warn(ctx, "unknown filter name (%s)", pdf_to_name(ctx, f));
 	return chain;
 }
 
@@ -218,6 +246,8 @@ build_filter_chain(fz_context *ctx, fz_stream *chain, pdf_document *doc, pdf_obj
 	pdf_obj *f;
 	pdf_obj *p;
 	int i, n;
+
+	fz_var(chain);
 
 	fz_try(ctx)
 	{
@@ -251,27 +281,54 @@ build_filter_chain(fz_context *ctx, fz_stream *chain, pdf_document *doc, pdf_obj
  * orig_num and orig_gen are used purely to seed the encryption.
  */
 static fz_stream *
-pdf_open_raw_filter(fz_context *ctx, fz_stream *chain, pdf_document *doc, pdf_obj *stmobj, int num, int orig_num, int orig_gen, fz_off_t offset)
+pdf_open_raw_filter(fz_context *ctx, fz_stream *chain, pdf_document *doc, pdf_obj *stmobj, int num, int *orig_num, int *orig_gen, int64_t offset)
 {
+	pdf_xref_entry *x = NULL;
+	fz_stream *chain2;
 	int hascrypt;
 	int len;
 
 	if (num > 0 && num < pdf_xref_len(ctx, doc))
 	{
-		pdf_xref_entry *entry = pdf_get_xref_entry(ctx, doc, num);
-		if (entry->stm_buf)
-			return fz_open_buffer(ctx, entry->stm_buf);
+		x = pdf_get_xref_entry(ctx, doc, num);
+		*orig_num = x->num;
+		*orig_gen = x->gen;
+		if (x->stm_buf)
+			return fz_open_buffer(ctx, x->stm_buf);
+	}
+	else
+	{
+		/* We only end up here when called from pdf_open_stream_with_offset to parse new format XRef sections. */
+		/* New style XRef sections must have generation number 0. */
+		*orig_num = num;
+		*orig_gen = 0;
 	}
 
-	/* don't close chain when we close this filter */
-	fz_keep_stream(ctx, chain);
+	chain = fz_keep_stream(ctx, chain);
 
-	len = pdf_to_int(ctx, pdf_dict_get(ctx, stmobj, PDF_NAME_Length));
-	chain = fz_open_null(ctx, chain, len, offset);
+	fz_var(chain);
 
-	hascrypt = pdf_stream_has_crypt(ctx, stmobj);
-	if (doc->crypt && !hascrypt)
-		chain = pdf_open_crypt(ctx, chain, doc->crypt, orig_num, orig_gen);
+	fz_try(ctx)
+	{
+		len = pdf_to_int(ctx, pdf_dict_get(ctx, stmobj, PDF_NAME_Length));
+
+		chain2 = chain;
+		chain = NULL;
+		chain = fz_open_null(ctx, chain2, len, offset);
+
+		hascrypt = pdf_stream_has_crypt(ctx, stmobj);
+		if (doc->crypt && !hascrypt)
+		{
+			chain2 = chain;
+			chain = NULL;
+			chain = pdf_open_crypt(ctx, chain2, doc->crypt, *orig_num, *orig_gen);
+		}
+	}
+	fz_catch(ctx)
+	{
+		fz_drop_stream(ctx, chain);
+		fz_rethrow(ctx);
+	}
 
 	return chain;
 }
@@ -281,15 +338,16 @@ pdf_open_raw_filter(fz_context *ctx, fz_stream *chain, pdf_document *doc, pdf_ob
  * to stream length and decrypting.
  */
 static fz_stream *
-pdf_open_filter(fz_context *ctx, pdf_document *doc, fz_stream *chain, pdf_obj *stmobj, int num, int orig_num, int orig_gen, fz_off_t offset, fz_compression_params *imparams)
+pdf_open_filter(fz_context *ctx, pdf_document *doc, fz_stream *chain, pdf_obj *stmobj, int num, int64_t offset, fz_compression_params *imparams)
 {
 	pdf_obj *filters;
 	pdf_obj *params;
+	int orig_num, orig_gen;
 
 	filters = pdf_dict_geta(ctx, stmobj, PDF_NAME_Filter, PDF_NAME_F);
 	params = pdf_dict_geta(ctx, stmobj, PDF_NAME_DecodeParms, PDF_NAME_DP);
 
-	chain = pdf_open_raw_filter(ctx, chain, doc, stmobj, num, orig_num, orig_gen, offset);
+	chain = pdf_open_raw_filter(ctx, chain, doc, stmobj, num, &orig_num, &orig_gen, offset);
 
 	fz_var(chain);
 
@@ -326,6 +384,7 @@ pdf_open_inline_stream(fz_context *ctx, pdf_document *doc, pdf_obj *stmobj, int 
 {
 	pdf_obj *filters;
 	pdf_obj *params;
+	int64_t offset;
 
 	filters = pdf_dict_geta(ctx, stmobj, PDF_NAME_Filter, PDF_NAME_F);
 	params = pdf_dict_geta(ctx, stmobj, PDF_NAME_DecodeParms, PDF_NAME_DP);
@@ -340,7 +399,16 @@ pdf_open_inline_stream(fz_context *ctx, pdf_document *doc, pdf_obj *stmobj, int 
 
 	if (imparams)
 		imparams->type = FZ_IMAGE_RAW;
-	return fz_open_null(ctx, chain, length, fz_tell(ctx, chain));
+
+	fz_try(ctx)
+		offset = fz_tell(ctx, chain);
+	fz_catch(ctx)
+	{
+		fz_drop_stream(ctx, chain);
+		fz_rethrow(ctx);
+	}
+
+	return fz_open_null(ctx, chain, length, offset);
 }
 
 void
@@ -371,39 +439,34 @@ pdf_load_compressed_inline_image(fz_context *ctx, pdf_document *doc, pdf_obj *di
  * Open a stream for reading the raw (compressed but decrypted) data.
  */
 fz_stream *
-pdf_open_raw_stream(fz_context *ctx, pdf_document *doc, int num, int gen)
-{
-	return pdf_open_raw_renumbered_stream(ctx, doc, num, gen, num, gen);
-}
-
-fz_stream *
-pdf_open_raw_renumbered_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int orig_num, int orig_gen)
+pdf_open_raw_stream_number(fz_context *ctx, pdf_document *doc, int num)
 {
 	pdf_xref_entry *x;
+	int orig_num, orig_gen;
 
 	if (num <= 0 || num >= pdf_xref_len(ctx, doc))
-		fz_throw(ctx, FZ_ERROR_GENERIC, "object id out of range (%d %d R)", num, gen);
+		fz_throw(ctx, FZ_ERROR_GENERIC, "object id out of range (%d 0 R)", num);
 
-	x = pdf_cache_object(ctx, doc, num, gen);
+	x = pdf_cache_object(ctx, doc, num);
 	if (x->stm_ofs == 0)
 		fz_throw(ctx, FZ_ERROR_GENERIC, "object is not a stream");
 
-	return pdf_open_raw_filter(ctx, doc->file, doc, x->obj, num, orig_num, orig_gen, x->stm_ofs);
+	return pdf_open_raw_filter(ctx, doc->file, doc, x->obj, num, &orig_num, &orig_gen, x->stm_ofs);
 }
 
 static fz_stream *
-pdf_open_image_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int orig_num, int orig_gen, fz_compression_params *params)
+pdf_open_image_stream(fz_context *ctx, pdf_document *doc, int num, fz_compression_params *params)
 {
 	pdf_xref_entry *x;
 
 	if (num <= 0 || num >= pdf_xref_len(ctx, doc))
-		fz_throw(ctx, FZ_ERROR_GENERIC, "object id out of range (%d %d R)", num, gen);
+		fz_throw(ctx, FZ_ERROR_GENERIC, "object id out of range (%d 0 R)", num);
 
-	x = pdf_cache_object(ctx, doc, num, gen);
+	x = pdf_cache_object(ctx, doc, num);
 	if (x->stm_ofs == 0 && x->stm_buf == NULL)
 		fz_throw(ctx, FZ_ERROR_GENERIC, "object is not a stream");
 
-	return pdf_open_filter(ctx, doc, doc->file, x->obj, num, orig_num, orig_gen, x->stm_ofs, params);
+	return pdf_open_filter(ctx, doc, doc->file, x->obj, num, x->stm_ofs, params);
 }
 
 /*
@@ -412,60 +475,58 @@ pdf_open_image_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int 
  * Using doc->file while a stream is open is a Bad idea.
  */
 fz_stream *
-pdf_open_stream(fz_context *ctx, pdf_document *doc, int num, int gen)
+pdf_open_stream_number(fz_context *ctx, pdf_document *doc, int num)
 {
-	return pdf_open_image_stream(ctx, doc, num, gen, num, gen, NULL);
+	return pdf_open_image_stream(ctx, doc, num, NULL);
 }
 
 fz_stream *
-pdf_open_stream_with_offset(fz_context *ctx, pdf_document *doc, int num, int gen, pdf_obj *dict, fz_off_t stm_ofs)
+pdf_open_stream_with_offset(fz_context *ctx, pdf_document *doc, int num, pdf_obj *dict, int64_t stm_ofs)
 {
 	if (stm_ofs == 0)
 		fz_throw(ctx, FZ_ERROR_GENERIC, "object is not a stream");
-
-	return pdf_open_filter(ctx, doc, doc->file, dict, num, num, gen, stm_ofs, NULL);
+	return pdf_open_filter(ctx, doc, doc->file, dict, num, stm_ofs, NULL);
 }
 
 /*
  * Load raw (compressed but decrypted) contents of a stream into buf.
  */
 fz_buffer *
-pdf_load_raw_stream(fz_context *ctx, pdf_document *doc, int num, int gen)
-{
-	return pdf_load_raw_renumbered_stream(ctx, doc, num, gen, num, gen);
-}
-
-fz_buffer *
-pdf_load_raw_renumbered_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int orig_num, int orig_gen)
+pdf_load_raw_stream_number(fz_context *ctx, pdf_document *doc, int num)
 {
 	fz_stream *stm;
 	pdf_obj *dict;
 	int len;
-	fz_buffer *buf;
+	fz_buffer *buf = NULL;
+	pdf_xref_entry *x;
 
 	if (num > 0 && num < pdf_xref_len(ctx, doc))
 	{
-		pdf_xref_entry *entry = pdf_get_xref_entry(ctx, doc, num);
-		if (entry->stm_buf)
-			return fz_keep_buffer(ctx, entry->stm_buf);
+		x = pdf_get_xref_entry(ctx, doc, num);
+		if (x->stm_buf)
+			return fz_keep_buffer(ctx, x->stm_buf);
 	}
 
-	dict = pdf_load_object(ctx, doc, num, gen);
+	dict = pdf_load_object(ctx, doc, num);
 
 	len = pdf_to_int(ctx, pdf_dict_get(ctx, dict, PDF_NAME_Length));
 
 	pdf_drop_obj(ctx, dict);
 
-	stm = pdf_open_raw_renumbered_stream(ctx, doc, num, gen, orig_num, orig_gen);
+	stm = pdf_open_raw_stream_number(ctx, doc, num);
 
-	buf = fz_read_all(ctx, stm, len);
+	fz_try(ctx)
+		buf = fz_read_all(ctx, stm, len);
+	fz_always(ctx)
+		fz_drop_stream(ctx, stm);
+	fz_catch(ctx)
+		fz_rethrow(ctx);
 
-	fz_drop_stream(ctx, stm);
 	return buf;
 }
 
 static int
-pdf_guess_filter_length(int len, char *filter)
+pdf_guess_filter_length(int len, const char *filter)
 {
 	if (!strcmp(filter, "ASCIIHexDecode"))
 		return len / 2;
@@ -509,7 +570,7 @@ can_reuse_buffer(fz_context *ctx, pdf_xref_entry *entry, fz_compression_params *
 	{
 		int len = pdf_array_len(ctx, f);
 
-		/* Empty array of filters. It's uncompressed. We can cope. */
+		/* Empty array of filters. Its uncompressed. We can cope. */
 		if (len == 0)
 			return 1;
 		/* 1 filter is the most we can hope to cope with - if more,*/
@@ -530,11 +591,10 @@ can_reuse_buffer(fz_context *ctx, pdf_xref_entry *entry, fz_compression_params *
 	build_compression_params(ctx, f, p, params);
 
 	return (params->type == FZ_IMAGE_RAW) ? 0 : 1;
-
 }
 
 static fz_buffer *
-pdf_load_image_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int orig_num, int orig_gen, fz_compression_params *params, int *truncated)
+pdf_load_image_stream(fz_context *ctx, pdf_document *doc, int num, fz_compression_params *params, int *truncated)
 {
 	fz_stream *stm = NULL;
 	pdf_obj *dict, *obj;
@@ -552,7 +612,7 @@ pdf_load_image_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int 
 			return fz_keep_buffer(ctx, entry->stm_buf);
 	}
 
-	dict = pdf_load_object(ctx, doc, num, gen);
+	dict = pdf_load_object(ctx, doc, num);
 
 	len = pdf_to_int(ctx, pdf_dict_get(ctx, dict, PDF_NAME_Length));
 	obj = pdf_dict_get(ctx, dict, PDF_NAME_Filter);
@@ -563,7 +623,7 @@ pdf_load_image_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int 
 
 	pdf_drop_obj(ctx, dict);
 
-	stm = pdf_open_image_stream(ctx, doc, num, gen, orig_num, orig_gen, params);
+	stm = pdf_open_image_stream(ctx, doc, num, params);
 
 	fz_try(ctx)
 	{
@@ -588,25 +648,25 @@ pdf_load_image_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int 
  * Load uncompressed contents of a stream into buf.
  */
 fz_buffer *
-pdf_load_stream(fz_context *ctx, pdf_document *doc, int num, int gen)
+pdf_load_stream_number(fz_context *ctx, pdf_document *doc, int num)
 {
-	return pdf_load_image_stream(ctx, doc, num, gen, num, gen, NULL, NULL);
+	return pdf_load_image_stream(ctx, doc, num, NULL, NULL);
 }
 
 fz_buffer *
-pdf_load_renumbered_stream(fz_context *ctx, pdf_document *doc, int num, int gen, int orig_num, int orig_gen, int *truncated)
+pdf_load_stream_truncated(fz_context *ctx, pdf_document *doc, int num, int *truncated)
 {
-	return pdf_load_image_stream(ctx, doc, num, gen, orig_num, orig_gen, NULL, truncated);
+	return pdf_load_image_stream(ctx, doc, num, NULL, truncated);
 }
 
 fz_compressed_buffer *
-pdf_load_compressed_stream(fz_context *ctx, pdf_document *doc, int num, int gen)
+pdf_load_compressed_stream(fz_context *ctx, pdf_document *doc, int num)
 {
 	fz_compressed_buffer *bc = fz_malloc_struct(ctx, fz_compressed_buffer);
 
 	fz_try(ctx)
 	{
-		bc->buffer = pdf_load_image_stream(ctx, doc, num, gen, num, gen, &bc->params, NULL);
+		bc->buffer = pdf_load_image_stream(ctx, doc, num, &bc->params, NULL);
 	}
 	fz_catch(ctx)
 	{
@@ -625,19 +685,19 @@ pdf_open_object_array(fz_context *ctx, pdf_document *doc, pdf_obj *list)
 	n = pdf_array_len(ctx, list);
 	stm = fz_open_concat(ctx, n, 1);
 
-	fz_var(i); /* Workaround Mac compiler bug */
 	for (i = 0; i < n; i++)
 	{
 		pdf_obj *obj = pdf_array_get(ctx, list, i);
 		fz_try(ctx)
-		{
-			fz_concat_push(ctx, stm, pdf_open_stream(ctx, doc, pdf_to_num(ctx, obj), pdf_to_gen(ctx, obj)));
-		}
+			fz_concat_push_drop(ctx, stm, pdf_open_stream(ctx, obj));
 		fz_catch(ctx)
 		{
-			fz_rethrow_if(ctx, FZ_ERROR_TRYLATER);
+			if (fz_caught(ctx) == FZ_ERROR_TRYLATER)
+			{
+				fz_drop_stream(ctx, stm);
+				fz_rethrow(ctx);
+			}
 			fz_warn(ctx, "cannot load content stream part %d/%d", i + 1, n);
-			continue;
 		}
 	}
 
@@ -647,15 +707,42 @@ pdf_open_object_array(fz_context *ctx, pdf_document *doc, pdf_obj *list)
 fz_stream *
 pdf_open_contents_stream(fz_context *ctx, pdf_document *doc, pdf_obj *obj)
 {
-	int num, gen;
+	int num;
 
 	if (pdf_is_array(ctx, obj))
 		return pdf_open_object_array(ctx, doc, obj);
 
 	num = pdf_to_num(ctx, obj);
-	gen = pdf_to_gen(ctx, obj);
 	if (pdf_is_stream(ctx, obj))
-		return pdf_open_image_stream(ctx, doc, num, gen, num, gen, NULL);
+		return pdf_open_image_stream(ctx, doc, num, NULL);
 
-	fz_throw(ctx, FZ_ERROR_GENERIC, "pdf object stream missing (%d %d R)", num, gen);
+	fz_throw(ctx, FZ_ERROR_GENERIC, "pdf object stream missing (%d 0 R)", num);
+}
+
+fz_buffer *pdf_load_raw_stream(fz_context *ctx, pdf_obj *ref)
+{
+	if (pdf_is_stream(ctx, ref))
+		return pdf_load_raw_stream_number(ctx, pdf_get_indirect_document(ctx, ref), pdf_to_num(ctx, ref));
+	fz_throw(ctx, FZ_ERROR_GENERIC, "object is not a stream");
+}
+
+fz_buffer *pdf_load_stream(fz_context *ctx, pdf_obj *ref)
+{
+	if (pdf_is_stream(ctx, ref))
+		return pdf_load_stream_number(ctx, pdf_get_indirect_document(ctx, ref), pdf_to_num(ctx, ref));
+	fz_throw(ctx, FZ_ERROR_GENERIC, "object is not a stream");
+}
+
+fz_stream *pdf_open_raw_stream(fz_context *ctx, pdf_obj *ref)
+{
+	if (pdf_is_stream(ctx, ref))
+		return pdf_open_raw_stream_number(ctx, pdf_get_indirect_document(ctx, ref), pdf_to_num(ctx, ref));
+	fz_throw(ctx, FZ_ERROR_GENERIC, "object is not a stream");
+}
+
+fz_stream *pdf_open_stream(fz_context *ctx, pdf_obj *ref)
+{
+	if (pdf_is_stream(ctx, ref))
+		return pdf_open_stream_number(ctx, pdf_get_indirect_document(ctx, ref), pdf_to_num(ctx, ref));
+	fz_throw(ctx, FZ_ERROR_GENERIC, "object is not a stream");
 }
